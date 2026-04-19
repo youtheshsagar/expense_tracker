@@ -3,3 +3,4 @@ uvicorn
 groq
 python-dotenv
 psycopg2-binary
+python-multipart
