@@ -1,9 +1,5 @@
 fastapi
-python-multipart
 uvicorn
 groq
-gspread
-google-auth
 python-dotenv
-pydantic
-requests
+psycopg2-binary
