@@ -4,3 +4,5 @@ groq
 python-dotenv
 psycopg2-binary
 python-multipart
+matplotlib
+resend
