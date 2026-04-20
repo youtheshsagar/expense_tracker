@@ -1,8 +1,9 @@
 fastapi
 uvicorn
 groq
-python-dotenv
 psycopg2-binary
-python-multipart
+python-dotenv
+requests
 matplotlib
+python-multipart
 resend
