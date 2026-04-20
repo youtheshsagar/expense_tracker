@@ -7,6 +7,8 @@ import json
 import uuid
 import io
 import re
+import os
+from dotenv import load_dotenv
 
 # OCR
 import pytesseract
@@ -17,37 +19,43 @@ import pdfplumber
 from groq import Groq
 
 # =========================
+# LOAD ENV
+# =========================
+load_dotenv()
+
+# =========================
 # FASTAPI APP
 # =========================
 app = FastAPI()
 
 # =========================
-# SUPABASE STORAGE
+# ENV VARIABLES
 # =========================
 SUPABASE_URL = "https://zasmsfjahuuwafjiajqp.supabase.co"
-SUPABASE_KEY = "sb_secret_iIdMxUb7v3TkVsYAeluidw_xswTv5kp"
+SUPABASE_KEY = os.getenv("SUPABASE_API_KEY")
 BUCKET = "expense-files"
 
+GROQ_KEY = os.getenv("GROQ_API_KEY")
+DB_CONN_STRING = os.getenv("DATABASE_URL")
+
+# =========================
+# CLIENTS
+# =========================
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+client = Groq(api_key=GROQ_KEY)
 
 # =========================
-# POSTGRES DB
+# DB CONNECTION
 # =========================
-DB_CONN_STRING = "postgresql://postgres.lcseodogwkycxnfqxjib:Youthi%40220387@aws-1-ap-southeast-1.pooler.supabase.com:5432/postgres?sslmode=require"
-
 def get_conn():
     return psycopg2.connect(DB_CONN_STRING)
-
-# =========================
-# GROQ LLM CLIENT
-# =========================
-client = Groq(api_key="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")
 
 # =========================
 # SAFE JSON PARSER
 # =========================
 def safe_json_parse(text):
     try:
+        text = text.strip().replace("```json", "").replace("```", "")
         return json.loads(text)
     except:
         match = re.search(r"\{.*\}", text, re.DOTALL)
@@ -56,15 +64,13 @@ def safe_json_parse(text):
         raise
 
 # =========================
-# LLM EXPENSE EXTRACTION
+# LLM EXTRACTION
 # =========================
 def extract_expense_with_llm(text):
     prompt = f"""
-You are an expense extraction system.
+Extract expense data.
 
-Extract structured data from the text below.
-
-Return ONLY valid JSON:
+Return ONLY JSON:
 {{
   "amount": number,
   "category": string,
@@ -78,39 +84,44 @@ TEXT:
 
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "user", "content": prompt}
-        ],
+        messages=[{"role": "user", "content": prompt}],
         temperature=0.1
     )
 
     return safe_json_parse(response.choices[0].message.content)
 
 # =========================
-# OCR / PDF TEXT EXTRACTION
+# OCR FUNCTION
 # =========================
 def extract_text(file_bytes, content_type):
-    if "pdf" in content_type:
-        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            return "\n".join([p.extract_text() or "" for p in pdf.pages])
+    try:
+        if "pdf" in content_type:
+            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+                return "\n".join([p.extract_text() or "" for p in pdf.pages])
 
-    image = Image.open(io.BytesIO(file_bytes))
-    return pytesseract.image_to_string(image)
+        image = Image.open(io.BytesIO(file_bytes))
+        return pytesseract.image_to_string(image)
+
+    except Exception as e:
+        print("OCR ERROR:", e)
+        return "OCR_FAILED"
 
 # =========================
-# SUPABASE FILE UPLOAD
+# SUPABASE UPLOAD
 # =========================
 def upload_file(file_bytes, filename):
     unique_name = f"{uuid.uuid4()}_{filename}"
 
-    supabase.storage.from_(BUCKET).upload(unique_name, file_bytes)
+    supabase.storage.from_(BUCKET).upload(
+        unique_name,
+        file_bytes,
+        file_options={"content-type": "application/octet-stream"}
+    )
 
-    url = supabase.storage.from_(BUCKET).get_public_url(unique_name)
-
-    return url
+    return supabase.storage.from_(BUCKET).get_public_url(unique_name)
 
 # =========================
-# DATABASE FUNCTIONS
+# DB FUNCTIONS
 # =========================
 def insert_text_expense(text):
     conn = get_conn()
@@ -208,26 +219,26 @@ async def twilio_webhook(request: Request):
 
         file_bytes = requests.get(media_url).content
 
-        # Upload to Supabase
+        # Upload
         file_url = upload_file(file_bytes, "expense_file")
 
-        # Extract text (OCR / PDF)
+        # OCR
         raw_text = extract_text(file_bytes, content_type)
 
-        # LLM processing
+        # LLM
         structured = extract_expense_with_llm(raw_text)
 
-        # Save file upload record
+        # Save file record
         insert_file_record(file_url, {
             "raw_text": raw_text,
             "llm_output": structured,
             "media_type": content_type
         })
 
-        # Save structured expense
+        # Save expense
         insert_structured_expense(structured, raw_text)
 
-        response.message("📊 Expense extracted & saved successfully")
+        response.message("📊 Expense processed successfully")
 
     except Exception as e:
         print("ERROR:", e)
