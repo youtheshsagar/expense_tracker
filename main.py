@@ -1,89 +1,122 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
 from groq import Groq
-import psycopg2
-import os
-import re
 import json
+import re
 import datetime
-import matplotlib.pyplot as plt
+import os
 from dotenv import load_dotenv
-import resend
+import psycopg2
 
-# -------------------------------
-# Load ENV
-# -------------------------------
-load_dotenv()
+# Load .env (for local)
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(_ROOT, ".env"))
 
 app = FastAPI()
 
+_groq_client = None
+
+
 # -------------------------------
-# LLM Client
+# 🧠 Groq Client
 # -------------------------------
 def get_groq():
-    return Groq(api_key=os.getenv("GROQ_API_KEY"))
+    global _groq_client
+    if _groq_client is None:
+        key = os.getenv("GROQ_API_KEY")
+        if not key:
+            raise RuntimeError("GROQ_API_KEY is not set")
+        _groq_client = Groq(api_key=key)
+    return _groq_client
+
 
 # -------------------------------
-# Expense Extraction (fallback)
+# 🧾 Fallback parser
 # -------------------------------
 def extract_expense_simple(text):
-    raw = text.lower()
-    amount = 0
+    if not text or not str(text).strip():
+        return {"category": "ignore", "amount": 0, "notes": ""}
 
-    m = re.search(r"(\d+)\s*k", raw)
+    raw = str(text).strip()
+    low = raw.lower()
+    amount = 0.0
+
+    m = re.search(r"(\d+(?:\.\d+)?)\s*k\b", low)
     if m:
-        amount = int(m.group(1)) * 1000
+        amount = float(m.group(1)) * 1000
     else:
-        m = re.search(r"\d+", raw)
+        m = re.search(r"(?:₹|rs\.?|inr)\s*(\d[\d,]*(?:\.\d+)?)", low)
         if m:
-            amount = int(m.group())
+            amount = float(m.group(1).replace(",", ""))
+        else:
+            m = re.search(r"\b(\d{4,})\b", low.replace(",", ""))
+            if m:
+                amount = float(m.group(1))
+            else:
+                m = re.search(r"\b(\d+(?:\.\d+)?)\b", low)
+                if m:
+                    amount = float(m.group(1))
 
     category = "general"
-    if "cement" in raw or "sand" in raw:
-        category = "materials"
-    elif "labour" in raw:
+    if any(w in low for w in ("labour", "labor", "mason", "worker")):
         category = "labour"
-    elif "diesel" in raw:
+    elif any(w in low for w in ("cement", "sand", "brick", "steel")):
+        category = "materials"
+    elif any(w in low for w in ("diesel", "fuel", "truck")):
         category = "transport"
 
-    if amount == 0:
-        return {"category": "ignore", "amount": 0, "notes": text}
+    if amount <= 0:
+        return {"category": "ignore", "amount": 0, "notes": raw}
 
-    return {"category": category, "amount": amount, "notes": text}
+    return {
+        "category": category,
+        "amount": int(round(amount)),
+        "notes": raw
+    }
+
 
 # -------------------------------
-# LLM Extraction
+# 🧠 LLM extraction
 # -------------------------------
 def extract_expense(text):
     try:
         client = get_groq()
-
-        res = client.chat.completions.create(
+        completion = client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=[
-                {"role": "system", "content": "Return only JSON"},
-                {"role": "user", "content": f"""
-Extract expense:
+                {"role": "system", "content": "Return ONLY valid JSON."},
+                {
+                    "role": "user",
+                    "content": f"""
+Extract expense from:
 {text}
 
 Return:
-{{"category":"", "amount":number, "notes":""}}
-"""}
+{{ "category": "", "amount": number, "notes": "" }}
+
+If not expense:
+{{ "category": "ignore", "amount": 0, "notes": "" }}
+"""
+                }
             ],
-            temperature=0
+            temperature=0,
+            max_tokens=100
         )
 
-        match = re.search(r"\{.*\}", res.choices[0].message.content)
+        raw = completion.choices[0].message.content
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+
         if match:
             return json.loads(match.group())
 
-    except:
+    except Exception:
         pass
 
     return extract_expense_simple(text)
 
+
 # -------------------------------
-# Save to DB
+# 🗄 PostgreSQL Save
 # -------------------------------
 def save_to_db(row):
     conn = psycopg2.connect(os.getenv("DATABASE_URL"))
@@ -99,134 +132,55 @@ def save_to_db(row):
     cur.close()
     conn.close()
 
-# -------------------------------
-# Query today's data
-# -------------------------------
-def get_today_summary():
-    conn = psycopg2.connect(os.getenv("DATABASE_URL"))
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT category, SUM(amount)
-        FROM expenses
-        WHERE DATE(recorded_at) = CURRENT_DATE
-        GROUP BY category
-    """)
-
-    data = cur.fetchall()
-
-    cur.close()
-    conn.close()
-    return data
 
 # -------------------------------
-# Chart generation
+# 🌐 Webhook endpoints
 # -------------------------------
-def generate_chart(data):
-    categories = [x[0] for x in data]
-    amounts = [float(x[1]) for x in data]
-
-    plt.figure()
-    plt.bar(categories, amounts)
-    plt.title("Daily Expenses")
-
-    path = "/tmp/chart.png"
-    plt.savefig(path)
-    plt.close()
-
-    return path
-
-# -------------------------------
-# LLM Analysis
-# -------------------------------
-def analyze_with_llm(data):
-    client = get_groq()
-
-    prompt = f"""
-You are a financial analyst.
-
-Data:
-{data}
-
-Tasks:
-1. Total spend
-2. Highest category
-3. Detect anomaly
-4. Give 1 suggestion
-
-Keep it short.
-"""
-
-    res = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3
+@app.get("/webhook")
+async def webhook_probe():
+    return Response(
+        content="OK — configure this URL in Twilio",
+        media_type="text/plain"
     )
 
-    return res.choices[0].message.content
 
-# -------------------------------
-# Email via Resend
-# -------------------------------
-def send_email(report, chart_path):
-    resend.api_key = os.getenv("RESEND_API_KEY")
-
-    with open(chart_path, "rb") as f:
-        chart = f.read()
-
-    resend.Emails.send({
-        "from": "Expense Tracker <onboarding@resend.dev>",
-        "to": [os.getenv("EMAIL_TO")],
-        "subject": "Daily Expense Report",
-        "html": f"<pre>{report}</pre>",
-        "attachments": [{
-            "filename": "chart.png",
-            "content": chart
-        }]
-    })
-
-# -------------------------------
-# Webhook
-# -------------------------------
 @app.post("/webhook")
 async def webhook(request: Request):
     data = await request.form()
-
-    msg = data.get("Body")
+    message = data.get("Body")
     sender = data.get("From")
 
-    parsed = extract_expense(msg)
+    print("📩 Incoming:", message)
+
+    parsed = extract_expense(message)
 
     if parsed["category"] == "ignore":
-        return Response("<Response><Message>Ignored</Message></Response>", media_type="application/xml")
+        return Response(
+            content="<Response><Message>Ignored ❌</Message></Response>",
+            media_type="application/xml"
+        )
 
-    save_to_db([
-        datetime.datetime.now(),
-        sender,
-        parsed["category"],
-        parsed["amount"],
-        parsed["notes"],
-        msg
-    ])
+    recorded_at = datetime.datetime.now()
+
+    try:
+        save_to_db([
+            recorded_at,
+            sender,
+            parsed["category"],
+            parsed["amount"],
+            parsed["notes"],
+            message
+        ])
+    except Exception as e:
+        print("DB Error:", e)
+        return Response(
+            content="<Response><Message>DB error ❌</Message></Response>",
+            media_type="application/xml"
+        )
+
+    print("✅ Saved:", parsed)
 
     return Response(
-        f"<Response><Message>Saved ₹{parsed['amount']}</Message></Response>",
+        content=f"<Response><Message>Saved ✅ ₹{parsed['amount']}</Message></Response>",
         media_type="application/xml"
     )
-
-# -------------------------------
-# Daily Report Endpoint
-# -------------------------------
-@app.get("/send-daily-report")
-def send_daily():
-    data = get_today_summary()
-
-    if not data:
-        return {"status": "no data"}
-
-    chart = generate_chart(data)
-    report = analyze_with_llm(data)
-
-    send_email(report, chart)
-
-    return {"status": "sent"}
