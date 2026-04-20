@@ -1,280 +1,236 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import Response
-from groq import Groq
-import json
-import re
-import datetime
-import os
+from twilio.twiml.messaging_response import MessagingResponse
+from supabase import create_client
 import psycopg2
 import requests
-import base64
-from dotenv import load_dotenv
-from requests.auth import HTTPBasicAuth
+import json
+import uuid
+import io
+import re
 
-# OPTIONAL OCR (safe fallback)
-try:
-    from PIL import Image
-    from io import BytesIO
-    import pytesseract
-    OCR_AVAILABLE = True
-except:
-    OCR_AVAILABLE = False
+# OCR
+import pytesseract
+from PIL import Image
+import pdfplumber
 
-# -------------------------------
-# ENV
-# -------------------------------
-load_dotenv()
+# LLM (GROQ)
+from groq import Groq
+
+# =========================
+# FASTAPI APP
+# =========================
 app = FastAPI()
 
-_groq_client = None
+# =========================
+# SUPABASE STORAGE
+# =========================
+SUPABASE_URL = "https://zasmsfjahuuwafjiajqp.supabase.co"
+SUPABASE_KEY = "sb_secret_iIdMxUb7v3TkVsYAeluidw_xswTv5kp"
+BUCKET = "expense-files"
 
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# -------------------------------
-# GROQ CLIENT
-# -------------------------------
-def get_groq():
-    global _groq_client
-    if _groq_client is None:
-        _groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    return _groq_client
+# =========================
+# POSTGRES DB
+# =========================
+DB_CONN_STRING = "postgresql://postgres.lcseodogwkycxnfqxjib:Youthi%40220387@aws-1-ap-southeast-1.pooler.supabase.com:5432/postgres?sslmode=require"
 
+def get_conn():
+    return psycopg2.connect(DB_CONN_STRING)
 
-# -------------------------------
-# DOWNLOAD IMAGE (TWILIO SAFE)
-# -------------------------------
-def download_image(url):
-    sid = os.getenv("TWILIO_ACCOUNT_SID")
-    token = os.getenv("TWILIO_AUTH_TOKEN")
+# =========================
+# GROQ LLM CLIENT
+# =========================
+client = Groq(api_key="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")
 
-    r = requests.get(
-        url,
-        auth=HTTPBasicAuth(sid, token),
-        headers={"User-Agent": "Mozilla/5.0"}
-    )
-
-    print("📸 IMAGE STATUS:", r.status_code)
-
-    if r.status_code != 200:
-        raise Exception(f"Image download failed: {r.status_code}")
-
-    return r.content
-
-
-# -------------------------------
-# OPTIONAL OCR (SAFE)
-# -------------------------------
-def extract_text_ocr(image_bytes):
-    if not OCR_AVAILABLE:
-        return ""
-
+# =========================
+# SAFE JSON PARSER
+# =========================
+def safe_json_parse(text):
     try:
-        img = Image.open(BytesIO(image_bytes))
-        text = pytesseract.image_to_string(img)
-        print("🧾 OCR TEXT:", text)
-        return text.strip()
-    except Exception as e:
-        print("OCR ERROR:", e)
-        return ""
-
-
-# -------------------------------
-# BASE64
-# -------------------------------
-def image_to_base64(image_bytes):
-    return base64.b64encode(image_bytes).decode()
-
-
-# -------------------------------
-# SAFE JSON PARSER (FIXES ARRAY ISSUE)
-# -------------------------------
-def safe_parse(raw):
-    try:
-        return json.loads(raw)
+        return json.loads(text)
     except:
-        try:
-            match = re.search(r"\{.*\}", raw, re.DOTALL)
-            if match:
-                return json.loads(match.group())
-        except:
-            pass
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+        raise
 
-    return {"category": "ignore", "amount": 0, "notes": "parse_failed"}
+# =========================
+# LLM EXPENSE EXTRACTION
+# =========================
+def extract_expense_with_llm(text):
+    prompt = f"""
+You are an expense extraction system.
 
+Extract structured data from the text below.
 
-# -------------------------------
-# SIMPLE TEXT FALLBACK
-# -------------------------------
-def extract_expense_simple(text):
-    if not text:
-        return {"category": "ignore", "amount": 0, "notes": ""}
-
-    raw = text.lower()
-    amount = 0
-
-    m = re.search(r"(\d+(?:\.\d+)?)\s*k\b", raw)
-    if m:
-        amount = float(m.group(1)) * 1000
-    else:
-        m = re.search(r"(?:₹|rs\.?|inr)?\s*(\d[\d,]*)", raw)
-        if m:
-            amount = float(m.group(1).replace(",", ""))
-
-    category = "general"
-    if "cement" in raw or "sand" in raw:
-        category = "materials"
-    elif "labour" in raw:
-        category = "labour"
-    elif "diesel" in raw:
-        category = "transport"
-
-    if amount <= 0:
-        return {"category": "ignore", "amount": 0, "notes": raw}
-
-    return {
-        "category": category,
-        "amount": int(amount),
-        "notes": raw
-    }
-
-
-# -------------------------------
-# HYBRID VISION ENGINE (FIXED PROMPT)
-# -------------------------------
-def hybrid_extract(image_url):
-    try:
-        client = get_groq()
-
-        img_bytes = download_image(image_url)
-
-        # OCR (optional)
-        ocr_text = extract_text_ocr(image_bytes)
-
-        img_b64 = image_to_base64(img_bytes)
-
-        res = client.chat.completions.create(
-            model="meta-llama/llama-4-scout-17b-16e-instruct",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"""
-You are a receipt extraction AI.
-
-OCR TEXT:
-{ocr_text}
-
-RULES:
-- Return ONLY ONE JSON OBJECT
-- DO NOT return arrays
-- Combine all items into single total
-
-FORMAT:
+Return ONLY valid JSON:
 {{
-  "category": "materials|labour|transport|general",
   "amount": number,
-  "notes": "summary"
+  "category": string,
+  "merchant": string,
+  "date": string
 }}
 
-If nothing found:
-{{"category":"ignore","amount":0,"notes":"no data"}}
+TEXT:
+{text}
 """
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{img_b64}"
-                            }
-                        }
-                    ]
-                }
-            ],
-            temperature=0
-        )
 
-        raw = res.choices[0].message.content
-        print("🧠 VISION RAW:", raw)
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.1
+    )
 
-        return safe_parse(raw)
+    return safe_json_parse(response.choices[0].message.content)
 
-    except Exception as e:
-        print("HYBRID ERROR:", e)
-        return {"category": "ignore", "amount": 0, "notes": "failed"}
+# =========================
+# OCR / PDF TEXT EXTRACTION
+# =========================
+def extract_text(file_bytes, content_type):
+    if "pdf" in content_type:
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            return "\n".join([p.extract_text() or "" for p in pdf.pages])
 
+    image = Image.open(io.BytesIO(file_bytes))
+    return pytesseract.image_to_string(image)
 
-# -------------------------------
-# DB SAVE
-# -------------------------------
-def save_to_db(row):
-    conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+# =========================
+# SUPABASE FILE UPLOAD
+# =========================
+def upload_file(file_bytes, filename):
+    unique_name = f"{uuid.uuid4()}_{filename}"
+
+    supabase.storage.from_(BUCKET).upload(unique_name, file_bytes)
+
+    url = supabase.storage.from_(BUCKET).get_public_url(unique_name)
+
+    return url
+
+# =========================
+# DATABASE FUNCTIONS
+# =========================
+def insert_text_expense(text):
+    conn = get_conn()
     cur = conn.cursor()
 
     cur.execute("""
-        INSERT INTO expenses 
-        (recorded_at, phone, category, amount, notes, raw_message)
-        VALUES (%s, %s, %s, %s, %s, %s)
-    """, row)
+        CREATE TABLE IF NOT EXISTS expenses (
+            id SERIAL PRIMARY KEY,
+            amount FLOAT,
+            category TEXT,
+            merchant TEXT,
+            expense_date TEXT,
+            raw_text TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cur.execute("""
+        INSERT INTO expenses (raw_text)
+        VALUES (%s)
+    """, (text,))
 
     conn.commit()
     cur.close()
     conn.close()
 
 
-# -------------------------------
-# WEBHOOK
-# -------------------------------
-@app.post("/webhook")
-async def webhook(request: Request):
-    data = await request.form()
+def insert_file_record(url, data):
+    conn = get_conn()
+    cur = conn.cursor()
 
-    message = data.get("Body")
-    sender = data.get("From")
-    num_media = int(data.get("NumMedia", 0))
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS expenses_file_upload (
+            id SERIAL PRIMARY KEY,
+            url TEXT,
+            content JSONB,
+            uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
 
-    print("📩 Incoming:", message, "Media:", num_media)
+    cur.execute("""
+        INSERT INTO expenses_file_upload (url, content)
+        VALUES (%s, %s)
+    """, (url, json.dumps(data)))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def insert_structured_expense(data, raw_text):
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO expenses (amount, category, merchant, expense_date, raw_text)
+        VALUES (%s, %s, %s, %s, %s)
+    """, (
+        data.get("amount"),
+        data.get("category"),
+        data.get("merchant"),
+        data.get("date"),
+        raw_text
+    ))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+# =========================
+# TWILIO WEBHOOK
+# =========================
+@app.post("/twilio/webhook")
+async def twilio_webhook(request: Request):
+    form = await request.form()
+    response = MessagingResponse()
 
     try:
-        if num_media > 0:
-            media_url = data.get("MediaUrl0")
-            print("📸 MEDIA URL:", media_url)
-            parsed = hybrid_extract(media_url)
-        else:
-            parsed = extract_expense_simple(message)
+        msg = form.get("Body")
+        num_media = int(form.get("NumMedia", 0))
 
-        print("✅ PARSED:", parsed)
+        # =========================
+        # TEXT MESSAGE
+        # =========================
+        if num_media == 0:
+            insert_text_expense(msg)
+            response.message("✅ Expense saved from text")
+            return str(response)
 
-        if parsed["category"] == "ignore":
-            return Response(
-                "<Response><Message>Could not read receipt ❌</Message></Response>",
-                media_type="application/xml"
-            )
+        # =========================
+        # FILE MESSAGE
+        # =========================
+        media_url = form.get("MediaUrl0")
+        content_type = form.get("MediaContentType0")
 
-        save_to_db([
-            datetime.datetime.now(),
-            sender,
-            parsed["category"],
-            parsed["amount"],
-            parsed["notes"],
-            message if message else "image"
-        ])
+        file_bytes = requests.get(media_url).content
 
-        return Response(
-            f"<Response><Message>Saved ₹{parsed['amount']} ✅</Message></Response>",
-            media_type="application/xml"
-        )
+        # Upload to Supabase
+        file_url = upload_file(file_bytes, "expense_file")
+
+        # Extract text (OCR / PDF)
+        raw_text = extract_text(file_bytes, content_type)
+
+        # LLM processing
+        structured = extract_expense_with_llm(raw_text)
+
+        # Save file upload record
+        insert_file_record(file_url, {
+            "raw_text": raw_text,
+            "llm_output": structured,
+            "media_type": content_type
+        })
+
+        # Save structured expense
+        insert_structured_expense(structured, raw_text)
+
+        response.message("📊 Expense extracted & saved successfully")
 
     except Exception as e:
-        print("🔥 WEBHOOK ERROR:", e)
-        return Response(
-            "<Response><Message>Error ❌</Message></Response>",
-            media_type="application/xml"
-        )
+        print("ERROR:", e)
+        response.message("❌ Failed to process file")
 
-
-# -------------------------------
-# HEALTH CHECK
-# -------------------------------
-@app.get("/")
-def root():
-    return {"status": "running"}
+    return str(response)
