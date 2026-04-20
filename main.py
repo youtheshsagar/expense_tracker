@@ -1,3 +1,4 @@
+
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import Response
 from groq import Groq
@@ -278,28 +279,30 @@ If image is completely unreadable:
     }
 
 # -------------------------------
-# Database Operations
+# Database Operations (UPDATED)
 # -------------------------------
 def save_text_expense(phone, parsed_data, raw_text):
+    """Save text expense with user phone tracking."""
     conn = get_db_connection()
     cur = conn.cursor()
 
     try:
         cur.execute("""
-            INSERT INTO expense (amount, category, merchant, expense_date, raw_text)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO expense (amount, category, merchant, expense_date, raw_text, user_phone)
+            VALUES (%s, %s, %s, %s, %s, %s)
             RETURNING id
         """, (
             parsed_data["amount"],
             parsed_data["category"],
             parsed_data["merchant"],
             datetime.date.today(),
-            raw_text
+            raw_text,
+            phone  # NEW: Add user phone
         ))
        
         expense_id = cur.fetchone()[0]
         conn.commit()
-        print(f"✅ Saved text expense ID: {expense_id}")
+        print(f"✅ Saved text expense ID: {expense_id} (User: {phone})")
         return expense_id
        
     except Exception as e:
@@ -310,7 +313,8 @@ def save_text_expense(phone, parsed_data, raw_text):
         cur.close()
         conn.close()
 
-def save_expense_from_file(parsed_data, file_url):
+def save_expense_from_file(parsed_data, file_url, user_phone):
+    """Save expense from image with user phone tracking."""
     conn = get_db_connection()
     cur = conn.cursor()
 
@@ -319,17 +323,19 @@ def save_expense_from_file(parsed_data, file_url):
         print(f"   Amount: ₹{parsed_data['amount']:,.2f}")
         print(f"   Category: {parsed_data['category']}")
         print(f"   Merchant: {parsed_data['merchant']}")
+        print(f"   User: {user_phone}")
        
         cur.execute("""
-            INSERT INTO expense (amount, category, merchant, expense_date, raw_text)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO expense (amount, category, merchant, expense_date, raw_text, user_phone)
+            VALUES (%s, %s, %s, %s, %s, %s)
             RETURNING id
         """, (
             parsed_data["amount"],
             parsed_data["category"],
             parsed_data["merchant"],
             datetime.date.today(),
-            f"Image: {file_url}\n{parsed_data['notes']}"
+            f"Image: {file_url}\n{parsed_data['notes']}",
+            user_phone  # NEW: Add user phone
         ))
        
         expense_id = cur.fetchone()[0]
@@ -349,12 +355,13 @@ def save_expense_from_file(parsed_data, file_url):
         conn.close()
 
 # -------------------------------
-# Media Processing
+# Media Processing (UPDATED)
 # -------------------------------
 def process_media(message_sid, phone, raw_text):
     try:
         print(f"\n{'#'*60}")
         print(f"📱 PROCESSING MEDIA - SID: {message_sid}")
+        print(f"   User: {phone}")
         print(f"{'#'*60}\n")
        
         twilio_client = get_twilio()
@@ -423,7 +430,8 @@ def process_media(message_sid, phone, raw_text):
                 "filename": filename,
                 "storage_path": storage_path,
                 "twilio_media_sid": media.sid,
-                "uploaded_at": datetime.datetime.now().isoformat()
+                "uploaded_at": datetime.datetime.now().isoformat(),
+                "user_phone": phone  # NEW: Track user
             }
            
             # Save to expense_file_upload
@@ -455,8 +463,8 @@ def process_media(message_sid, phone, raw_text):
                
                 parsed_expense = extract_expense_from_image(file_url)
                
-                # Save to expense table
-                expense_id = save_expense_from_file(parsed_expense, file_url)
+                # Save to expense table with user phone
+                expense_id = save_expense_from_file(parsed_expense, file_url, phone)
                
                 if expense_id:
                     # Update file_upload with extraction data
@@ -508,7 +516,7 @@ def get_today_summary():
     cur.execute("""
         SELECT category, SUM(amount)
         FROM expense
-        WHERE expense_date = CURRENT_DATE
+        WHERE expense_date::date = CURRENT_DATE
         GROUP BY category
         ORDER BY SUM(amount) DESC
     """)
@@ -709,42 +717,147 @@ def health():
     return {
         "status": "active",
         "service": "expense-tracker",
-        "version": "4.0-groq-vision",
+        "version": "4.1-user-tracking",
         "models": {
-            "text": "llama-3.1-8b-instant",
+            "text": "meta-llama/llama-4-scout-17b-16e-instruct",
             "vision": "meta-llama/llama-4-scout-17b-16e-instruct",
             "analysis": "llama-3.3-70b-versatile"
         },
-        "provider": "Groq (100% free)"
+        "provider": "Groq (100% free)",
+        "features": ["user_tracking", "vision_ai", "auto_categorization"]
     }
 
+# -------------------------------
+# API Endpoints (UPDATED)
+# -------------------------------
 @app.get("/expenses/today")
 def get_today():
+    """Get today's expenses with user tracking."""
     conn = get_db_connection()
     cur = conn.cursor()
 
-    cur.execute("""
-        SELECT id, amount, category, merchant, raw_text,
-               TO_CHAR(expense_date, 'YYYY-MM-DD') as date
-        FROM expense
-        WHERE expense_date = CURRENT_DATE
-        ORDER BY id DESC
-    """)
+    try:
+        cur.execute("""
+            SELECT
+                id,
+                amount,
+                category,
+                merchant,
+                raw_text,
+                expense_date::text as date,
+                user_phone
+            FROM expense
+            WHERE expense_date::date = CURRENT_DATE
+            ORDER BY id DESC
+        """)
 
-    columns = [desc[0] for desc in cur.description]
-    results = [dict(zip(columns, row)) for row in cur.fetchall()]
+        columns = [desc[0] for desc in cur.description]
+        results = [dict(zip(columns, row)) for row in cur.fetchall()]
 
-    cur.close()
-    conn.close()
+        total = sum(float(r['amount']) for r in results)
 
-    total = sum(float(r['amount']) for r in results)
+        return {
+            "date": datetime.date.today().isoformat(),
+            "count": len(results),
+            "total": f"₹{total:,.2f}",
+            "expenses": results
+        }
+       
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        return {"status": "error", "error": str(e)}
+    finally:
+        cur.close()
+        conn.close()
 
-    return {
-        "date": datetime.date.today().isoformat(),
-        "count": len(results),
-        "total": f"₹{total:,.2f}",
-        "expenses": results
-    }
+
+@app.get("/expenses/by-user")
+def get_by_user():
+    """Get expense summary by user."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            SELECT
+                user_phone,
+                COUNT(*) as count,
+                SUM(amount) as total,
+                MIN(expense_date::date) as first_expense,
+                MAX(expense_date::date) as last_expense
+            FROM expense
+            WHERE user_phone IS NOT NULL
+            GROUP BY user_phone
+            ORDER BY total DESC
+        """)
+
+        columns = [desc[0] for desc in cur.description]
+        results = [dict(zip(columns, row)) for row in cur.fetchall()]
+
+        # Format numbers
+        for r in results:
+            r['total'] = float(r['total'])
+            r['count'] = int(r['count'])
+            r['first_expense'] = str(r['first_expense'])
+            r['last_expense'] = str(r['last_expense'])
+
+        return {
+            "user_count": len(results),
+            "users": results
+        }
+       
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        return {"status": "error", "error": str(e)}
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.get("/expenses/user/{phone}")
+def get_user_expenses(phone: str):
+    """Get all expenses for a specific user."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    try:
+        # Clean phone format
+        phone_clean = phone.replace(" ", "").replace("-", "")
+        if not phone_clean.startswith("+"):
+            phone_clean = f"+{phone_clean}"
+
+        cur.execute("""
+            SELECT
+                id,
+                amount,
+                category,
+                merchant,
+                raw_text,
+                expense_date::text as date
+            FROM expense
+            WHERE user_phone = %s
+            ORDER BY expense_date DESC, id DESC
+            LIMIT 100
+        """, (phone_clean,))
+
+        columns = [desc[0] for desc in cur.description]
+        results = [dict(zip(columns, row)) for row in cur.fetchall()]
+
+        total = sum(float(r['amount']) for r in results)
+
+        return {
+            "user_phone": phone_clean,
+            "count": len(results),
+            "total": f"₹{total:,.2f}",
+            "expenses": results
+        }
+       
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        return {"status": "error", "error": str(e)}
+    finally:
+        cur.close()
+        conn.close()
 
 @app.get("/file-uploads/today")
 def get_uploads():
