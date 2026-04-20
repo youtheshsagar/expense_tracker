@@ -17,8 +17,7 @@ from requests.auth import HTTPBasicAuth
 # -------------------------------
 # ENV
 # -------------------------------
-_ROOT = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(_ROOT, ".env"))
+load_dotenv()
 
 app = FastAPI()
 
@@ -26,20 +25,17 @@ _groq_client = None
 
 
 # -------------------------------
-# Groq Client
+# GROQ CLIENT
 # -------------------------------
 def get_groq():
     global _groq_client
     if _groq_client is None:
-        key = os.getenv("GROQ_API_KEY")
-        if not key:
-            raise RuntimeError("GROQ_API_KEY missing")
-        _groq_client = Groq(api_key=key)
+        _groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
     return _groq_client
 
 
 # -------------------------------
-# Download Twilio image (AUTH REQUIRED)
+# TWILIO IMAGE DOWNLOAD (FIXED)
 # -------------------------------
 def download_image(url):
     sid = os.getenv("TWILIO_ACCOUNT_SID")
@@ -51,7 +47,7 @@ def download_image(url):
         headers={"User-Agent": "Mozilla/5.0"}
     )
 
-    print("IMAGE STATUS:", r.status_code)
+    print("📸 IMAGE STATUS:", r.status_code)
 
     if r.status_code != 200:
         raise Exception(f"Image download failed: {r.status_code}")
@@ -60,29 +56,34 @@ def download_image(url):
 
 
 # -------------------------------
-# OCR extraction
+# OCR
 # -------------------------------
 def extract_text_ocr(image_bytes):
-    img = Image.open(BytesIO(image_bytes))
-    text = pytesseract.image_to_string(img)
-    return text
+    try:
+        img = Image.open(BytesIO(image_bytes))
+        text = pytesseract.image_to_string(img)
+        print("🧾 OCR TEXT:\n", text)
+        return text.strip()
+    except Exception as e:
+        print("OCR ERROR:", e)
+        return ""
 
 
 # -------------------------------
-# Base64 converter
+# BASE64
 # -------------------------------
 def image_to_base64(image_bytes):
-    return base64.b64encode(image_bytes).decode("utf-8")
+    return base64.b64encode(image_bytes).decode()
 
 
 # -------------------------------
-# TEXT fallback parser
+# TEXT FALLBACK
 # -------------------------------
 def extract_expense_simple(text):
     if not text:
         return {"category": "ignore", "amount": 0, "notes": ""}
 
-    raw = str(text).strip().lower()
+    raw = text.lower()
     amount = 0
 
     m = re.search(r"(\d+(?:\.\d+)?)\s*k\b", raw)
@@ -98,7 +99,7 @@ def extract_expense_simple(text):
         category = "materials"
     elif "labour" in raw:
         category = "labour"
-    elif "diesel" in raw or "fuel" in raw:
+    elif "diesel" in raw:
         category = "transport"
 
     if amount <= 0:
@@ -112,20 +113,18 @@ def extract_expense_simple(text):
 
 
 # -------------------------------
-# HYBRID OCR + VISION ENGINE
+# HYBRID OCR + VISION (MAIN ENGINE)
 # -------------------------------
 def hybrid_extract(image_url):
     try:
         client = get_groq()
 
-        # 1. Download image
         img_bytes = download_image(image_url)
 
-        # 2. OCR TEXT
+        # OCR
         ocr_text = extract_text_ocr(img_bytes)
-        print("OCR TEXT:", ocr_text)
 
-        # 3. Vision AI
+        # Vision
         img_b64 = image_to_base64(img_bytes)
 
         res = client.chat.completions.create(
@@ -137,27 +136,25 @@ def hybrid_extract(image_url):
                         {
                             "type": "text",
                             "text": f"""
-You are an expense extraction system.
-
-Use BOTH OCR text and image.
+You are a receipt extractor.
 
 OCR TEXT:
 {ocr_text}
 
-TASK:
+RULES:
+- Extract expense even if partially visible
 - Fix OCR mistakes
-- Extract expense
-- Identify category
+- Always return valid JSON
 
-Return ONLY JSON:
+FORMAT:
 {{
   "category": "materials|labour|transport|general",
   "amount": number,
   "notes": "short summary"
 }}
 
-If no expense:
-{{"category":"ignore","amount":0,"notes":"none"}}
+If nothing found:
+{{"category":"ignore","amount":0,"notes":"no data"}}
 """
                         },
                         {
@@ -173,7 +170,7 @@ If no expense:
         )
 
         raw = res.choices[0].message.content
-        print("VISION OUTPUT:", raw)
+        print("🧠 VISION RAW:\n", raw)
 
         match = re.search(r"\{.*\}", raw, re.DOTALL)
         if match:
@@ -214,28 +211,24 @@ async def webhook(request: Request):
     sender = data.get("From")
     num_media = int(data.get("NumMedia", 0))
 
-    print("Incoming:", message, "Media:", num_media)
+    print("📩 Incoming:", message, "Media:", num_media)
 
-    # IMAGE FLOW
-    if num_media > 0:
-        media_url = data.get("MediaUrl0")
-        print("Media URL:", media_url)
-
-        parsed = hybrid_extract(media_url)
-
-    # TEXT FLOW
-    else:
-        parsed = extract_expense_simple(message)
-
-    # IGNORE
-    if parsed["category"] == "ignore":
-        return Response(
-            "<Response><Message>Could not read receipt ❌</Message></Response>",
-            media_type="application/xml"
-        )
-
-    # SAVE
     try:
+        if num_media > 0:
+            media_url = data.get("MediaUrl0")
+            print("📸 MEDIA URL:", media_url)
+            parsed = hybrid_extract(media_url)
+        else:
+            parsed = extract_expense_simple(message)
+
+        print("✅ PARSED RESULT:", parsed)
+
+        if parsed["category"] == "ignore":
+            return Response(
+                "<Response><Message>Could not read receipt ❌</Message></Response>",
+                media_type="application/xml"
+            )
+
         save_to_db([
             datetime.datetime.now(),
             sender,
@@ -244,17 +237,18 @@ async def webhook(request: Request):
             parsed["notes"],
             message if message else "image"
         ])
-    except Exception as e:
-        print("DB ERROR:", e)
+
         return Response(
-            "<Response><Message>DB error ❌</Message></Response>",
+            f"<Response><Message>Saved ₹{parsed['amount']} ✅</Message></Response>",
             media_type="application/xml"
         )
 
-    return Response(
-        f"<Response><Message>Saved ₹{parsed['amount']} ✅</Message></Response>",
-        media_type="application/xml"
-    )
+    except Exception as e:
+        print("🔥 WEBHOOK ERROR:", e)
+        return Response(
+            "<Response><Message>Server error ❌</Message></Response>",
+            media_type="application/xml"
+        )
 
 
 # -------------------------------
