@@ -53,35 +53,80 @@ def safe_json_parse(text):
         raise
 
 # =========================
-# DOWNLOAD TWILIO MEDIA (FIX)
+# ROBUST TWILIO DOWNLOAD
 # =========================
 def download_media(url):
-    headers = {"User-Agent": "Mozilla/5.0"}
-    r = requests.get(url, headers=headers, allow_redirects=True)
-    return r.content
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "*/*"
+    }
+
+    try:
+        r = requests.get(url, headers=headers, allow_redirects=True, timeout=20)
+        return r.content, r.headers.get("Content-Type", "")
+    except Exception as e:
+        print("DOWNLOAD ERROR:", e)
+        return None, None
 
 # =========================
-# OCR SAFE
+# FILE VALIDATION
+# =========================
+def is_valid_file(file_bytes):
+    if not file_bytes:
+        return False
+
+    # HTML response detection (VERY COMMON Twilio issue)
+    if file_bytes[:4] == b"<htm" or b"<html" in file_bytes[:100]:
+        return False
+
+    if len(file_bytes) < 200:
+        return False
+
+    return True
+
+# =========================
+# OCR + PDF FIXED
 # =========================
 def extract_text(file_bytes, content_type):
     try:
+        if not is_valid_file(file_bytes):
+            print("INVALID FILE DETECTED")
+            return None
+
+        # ======================
+        # PDF HANDLING
+        # ======================
         if "pdf" in content_type:
-            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-                return "\n".join([p.extract_text() or "" for p in pdf.pages])
+            try:
+                with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+                    text = "\n".join([p.extract_text() or "" for p in pdf.pages])
+                    return text if text.strip() else None
+            except Exception as e:
+                print("PDF ERROR:", e)
+                return None
 
-        image_stream = io.BytesIO(file_bytes)
-        image = Image.open(image_stream)
-        image.verify()
+        # ======================
+        # IMAGE HANDLING
+        # ======================
+        try:
+            image = Image.open(io.BytesIO(file_bytes))
+            image.verify()
 
-        image = Image.open(io.BytesIO(file_bytes))
-        return pytesseract.image_to_string(image)
+            image = Image.open(io.BytesIO(file_bytes))
+            text = pytesseract.image_to_string(image)
+
+            return text if text.strip() else None
+
+        except Exception as e:
+            print("IMAGE OCR ERROR:", e)
+            return None
 
     except Exception as e:
-        print("OCR ERROR:", e)
+        print("GENERAL OCR ERROR:", e)
         return None
 
 # =========================
-# LLM EXPENSE EXTRACTION
+# LLM EXTRACTION
 # =========================
 def extract_expense_with_llm(text):
     prompt = f"""
@@ -188,7 +233,7 @@ def home():
     return {"status": "running"}
 
 # =========================
-# TWILIO WEBHOOK (FIXED PIPELINE)
+# TWILIO WEBHOOK (FINAL FIXED)
 # =========================
 @app.post("/twilio/webhook")
 async def webhook(request: Request):
@@ -200,7 +245,7 @@ async def webhook(request: Request):
         num_media = int(form.get("NumMedia", 0) or 0)
 
         # ======================
-        # TEXT MESSAGE
+        # TEXT FLOW
         # ======================
         if num_media == 0:
             structured = extract_expense_with_llm(msg)
@@ -213,19 +258,22 @@ async def webhook(request: Request):
             return str(response)
 
         # ======================
-        # FILE MESSAGE
+        # FILE FLOW
         # ======================
         media_url = form.get("MediaUrl0")
-        content_type = form.get("MediaContentType0", "")
 
-        file_bytes = download_media(media_url)
+        file_bytes, content_type = download_media(media_url)
+
+        if not file_bytes:
+            response.message("❌ Failed to download file")
+            return str(response)
 
         file_url = upload_file(file_bytes, "expense_file")
 
         raw_text = extract_text(file_bytes, content_type)
 
         if not raw_text:
-            response.message("❌ Could not read image/PDF")
+            response.message("⚠️ Could not read image/PDF")
             return str(response)
 
         structured = extract_expense_with_llm(raw_text)
@@ -242,6 +290,6 @@ async def webhook(request: Request):
 
     except Exception as e:
         print("FULL ERROR:", str(e))
-        response.message("❌ Failed to process file")
+        response.message("❌ Failed to process request")
 
     return str(response)
