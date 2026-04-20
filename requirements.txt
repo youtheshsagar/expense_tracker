@@ -9,3 +9,6 @@ python-multipart
 resend
 pillow
 pytesseract
+twilio
+supabase
+pdfplumber
