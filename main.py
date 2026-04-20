@@ -1,7 +1,9 @@
+
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import Response
 from groq import Groq
 import psycopg2
+import psycopg2.extras
 import os
 import re
 import json
@@ -303,7 +305,7 @@ def process_media(message_sid, phone, raw_text):
     Complete media processing workflow:
     1. Download media from Twilio
     2. Upload to Supabase Storage (expense-files bucket)
-    3. Save to expense_file_upload table with URL and content type
+    3. Save to expense_file_upload table with URL and content metadata (JSONB)
     4. Use LLM vision to extract expense data from images
     5. Save extracted expense data to expense table
     6. Update expense_file_upload with merchant info
@@ -350,7 +352,7 @@ def process_media(message_sid, phone, raw_text):
            
             print(f"✓ Downloaded from Twilio ({len(response.content)} bytes)")
            
-            # Determine file extension
+            # Determine file extension and content type
             content_type = meta.get("content_type") or media.content_type or "application/octet-stream"
             ext = content_type.split("/")[-1]
             if ext == "jpeg":
@@ -373,15 +375,25 @@ def process_media(message_sid, phone, raw_text):
             print(f"✓ Uploaded to storage: {storage_path}")
             print(f"✓ Public URL: {file_url}")
            
-            # STEP 1: Save to expense_file_upload table
+            # Prepare JSONB content metadata
+            content_metadata = {
+                "content_type": content_type,
+                "file_size": len(response.content),
+                "filename": filename,
+                "storage_path": storage_path,
+                "twilio_media_sid": media.sid,
+                "uploaded_at": datetime.datetime.now().isoformat()
+            }
+           
+            # STEP 1: Save to expense_file_upload table with JSONB content
             try:
                 cur.execute("""
                     INSERT INTO expense_file_upload (url, content, merchant, expense_date, raw_text)
-                    VALUES (%s, %s, %s, %s, %s)
+                    VALUES (%s, %s::jsonb, %s, %s, %s)
                     RETURNING id
                 """, (
                     file_url,
-                    content_type,
+                    json.dumps(content_metadata),  # Store as JSONB
                     "unknown",  # Will be updated after LLM processing
                     datetime.date.today(),
                     raw_text or ""
@@ -391,6 +403,7 @@ def process_media(message_sid, phone, raw_text):
                 conn.commit()
                
                 print(f"✓ Saved to expense_file_upload table, ID: {file_upload_id}")
+                print(f"✓ Content metadata: {json.dumps(content_metadata, indent=2)}")
                
             except Exception as e:
                 conn.rollback()
@@ -414,15 +427,28 @@ def process_media(message_sid, phone, raw_text):
                     expense_id = save_expense_from_file(parsed_expense, file_url)
                    
                     if expense_id:
-                        # STEP 4: Update expense_file_upload with extracted merchant
+                        # STEP 4: Update expense_file_upload with extracted merchant and LLM data
                         try:
+                            # Add LLM extraction data to content metadata
+                            content_metadata["llm_extraction"] = {
+                                "extracted_at": datetime.datetime.now().isoformat(),
+                                "model": "llama-4-scout-17b-16e-instruct",
+                                "expense_id": expense_id,
+                                "extracted_data": parsed_expense
+                            }
+                           
                             cur.execute("""
                                 UPDATE expense_file_upload
-                                SET merchant = %s
+                                SET merchant = %s,
+                                    content = %s::jsonb
                                 WHERE id = %s
-                            """, (parsed_expense["merchant"], file_upload_id))
+                            """, (
+                                parsed_expense["merchant"],
+                                json.dumps(content_metadata),
+                                file_upload_id
+                            ))
                             conn.commit()
-                            print(f"✓ Updated merchant in expense_file_upload")
+                            print(f"✓ Updated merchant and LLM data in expense_file_upload")
                         except Exception as e:
                             print(f"✗ Error updating merchant: {e}")
                     else:
@@ -687,6 +713,34 @@ def get_today_expenses():
         "count": len(results),
         "total": f"₹{total:,.2f}",
         "expenses": results
+    }
+
+# -------------------------------
+# Get File Uploads
+# -------------------------------
+@app.get("/file-uploads/today")
+def get_today_file_uploads():
+    """Get all file uploads for today with content metadata."""
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    cur.execute("""
+        SELECT id, url, content, merchant,
+               TO_CHAR(expense_date, 'YYYY-MM-DD') as date, raw_text
+        FROM expense_file_upload
+        WHERE expense_date = CURRENT_DATE
+        ORDER BY id DESC
+    """)
+
+    results = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
+    return {
+        "date": datetime.date.today().isoformat(),
+        "count": len(results),
+        "uploads": results
     }
 
 # -------------------------------
