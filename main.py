@@ -128,7 +128,7 @@ def hybrid_extract(image_url):
         img_b64 = image_to_base64(img_bytes)
 
         res = client.chat.completions.create(
-            model="llama-3.2-11b-vision-preview",
+            model="meta-llama/llama-4-maverick-17b-128e-instruct",
             messages=[
                 {
                     "role": "user",
