@@ -183,7 +183,7 @@ If image is completely unreadable:
         print(f"🤖 Sending to Groq Llama Vision...")
        
         completion = client.chat.completions.create(
-            model="llama-3.2-90b-vision-preview",  # Groq's vision model
+            model="meta-llama/llama-4-scout-17b-16e-instruct",  # Groq's vision model
             messages=[
                 {
                     "role": "user",
