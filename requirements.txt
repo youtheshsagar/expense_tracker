@@ -7,3 +7,5 @@ requests
 matplotlib
 python-multipart
 resend
+pillow
+pytesseract

@@ -9,6 +9,10 @@ import psycopg2
 import requests
 import base64
 from dotenv import load_dotenv
+from PIL import Image
+from io import BytesIO
+import pytesseract
+from requests.auth import HTTPBasicAuth
 
 # -------------------------------
 # ENV
@@ -35,25 +39,44 @@ def get_groq():
 
 
 # -------------------------------
-# Download image
+# Download Twilio image (AUTH REQUIRED)
 # -------------------------------
 def download_image(url):
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
-    response = requests.get(url, headers=headers)
-    return response.content
+    sid = os.getenv("TWILIO_ACCOUNT_SID")
+    token = os.getenv("TWILIO_AUTH_TOKEN")
+
+    r = requests.get(
+        url,
+        auth=HTTPBasicAuth(sid, token),
+        headers={"User-Agent": "Mozilla/5.0"}
+    )
+
+    print("IMAGE STATUS:", r.status_code)
+
+    if r.status_code != 200:
+        raise Exception(f"Image download failed: {r.status_code}")
+
+    return r.content
 
 
 # -------------------------------
-# Convert image to base64
+# OCR extraction
+# -------------------------------
+def extract_text_ocr(image_bytes):
+    img = Image.open(BytesIO(image_bytes))
+    text = pytesseract.image_to_string(img)
+    return text
+
+
+# -------------------------------
+# Base64 converter
 # -------------------------------
 def image_to_base64(image_bytes):
     return base64.b64encode(image_bytes).decode("utf-8")
 
 
 # -------------------------------
-# Text fallback parser
+# TEXT fallback parser
 # -------------------------------
 def extract_expense_simple(text):
     if not text:
@@ -66,16 +89,16 @@ def extract_expense_simple(text):
     if m:
         amount = float(m.group(1)) * 1000
     else:
-        m = re.search(r"(?:₹|rs\.?|inr)?\s*(\d[\d,]*(?:\.\d+)?)", raw)
+        m = re.search(r"(?:₹|rs\.?|inr)?\s*(\d[\d,]*)", raw)
         if m:
             amount = float(m.group(1).replace(",", ""))
 
     category = "general"
-    if any(x in raw for x in ["cement", "sand", "brick", "steel"]):
+    if "cement" in raw or "sand" in raw:
         category = "materials"
-    elif any(x in raw for x in ["labour", "worker", "mason"]):
+    elif "labour" in raw:
         category = "labour"
-    elif any(x in raw for x in ["diesel", "fuel"]):
+    elif "diesel" in raw or "fuel" in raw:
         category = "transport"
 
     if amount <= 0:
@@ -83,54 +106,26 @@ def extract_expense_simple(text):
 
     return {
         "category": category,
-        "amount": int(round(amount)),
+        "amount": int(amount),
         "notes": raw
     }
 
 
 # -------------------------------
-# LLM text extraction
+# HYBRID OCR + VISION ENGINE
 # -------------------------------
-def extract_expense(text):
+def hybrid_extract(image_url):
     try:
         client = get_groq()
 
-        res = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": "Return ONLY JSON"},
-                {"role": "user", "content": f"""
-Extract expense:
-
-{text}
-
-Return:
-{{"category":"", "amount":number, "notes":""}}
-"""}
-            ],
-            temperature=0
-        )
-
-        raw = res.choices[0].message.content
-        match = re.search(r"\{.*\}", raw, re.DOTALL)
-
-        if match:
-            return json.loads(match.group())
-
-    except Exception as e:
-        print("TEXT LLM ERROR:", e)
-
-    return extract_expense_simple(text)
-
-
-# -------------------------------
-# IMAGE → EXPENSE (VISION MODEL)
-# -------------------------------
-def extract_from_image(image_url):
-    try:
-        client = get_groq()
-
+        # 1. Download image
         img_bytes = download_image(image_url)
+
+        # 2. OCR TEXT
+        ocr_text = extract_text_ocr(img_bytes)
+        print("OCR TEXT:", ocr_text)
+
+        # 3. Vision AI
         img_b64 = image_to_base64(img_bytes)
 
         res = client.chat.completions.create(
@@ -141,22 +136,28 @@ def extract_from_image(image_url):
                     "content": [
                         {
                             "type": "text",
-                            "text": """
-Extract expense from this receipt image.
+                            "text": f"""
+You are an expense extraction system.
+
+Use BOTH OCR text and image.
+
+OCR TEXT:
+{ocr_text}
+
+TASK:
+- Fix OCR mistakes
+- Extract expense
+- Identify category
 
 Return ONLY JSON:
-{
-  "category": "",
+{{
+  "category": "materials|labour|transport|general",
   "amount": number,
-  "notes": ""
-}
+  "notes": "short summary"
+}}
 
-If not an expense:
-{
-  "category": "ignore",
-  "amount": 0,
-  "notes": ""
-}
+If no expense:
+{{"category":"ignore","amount":0,"notes":"none"}}
 """
                         },
                         {
@@ -172,15 +173,16 @@ If not an expense:
         )
 
         raw = res.choices[0].message.content
-        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        print("VISION OUTPUT:", raw)
 
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
         if match:
             return json.loads(match.group())
 
     except Exception as e:
-        print("IMAGE LLM ERROR:", e)
+        print("HYBRID ERROR:", e)
 
-    return {"category": "ignore", "amount": 0, "notes": "image_failed"}
+    return {"category": "ignore", "amount": 0, "notes": "failed"}
 
 
 # -------------------------------
@@ -202,15 +204,7 @@ def save_to_db(row):
 
 
 # -------------------------------
-# HEALTH CHECK
-# -------------------------------
-@app.get("/webhook")
-async def webhook_probe():
-    return {"status": "ok"}
-
-
-# -------------------------------
-# MAIN WEBHOOK (TEXT + IMAGE)
+# WEBHOOK
 # -------------------------------
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -222,33 +216,25 @@ async def webhook(request: Request):
 
     print("Incoming:", message, "Media:", num_media)
 
-    # -----------------------
     # IMAGE FLOW
-    # -----------------------
     if num_media > 0:
         media_url = data.get("MediaUrl0")
-        print("Image URL:", media_url)
+        print("Media URL:", media_url)
 
-        parsed = extract_from_image(media_url)
+        parsed = hybrid_extract(media_url)
 
-    # -----------------------
     # TEXT FLOW
-    # -----------------------
     else:
-        parsed = extract_expense(message)
+        parsed = extract_expense_simple(message)
 
-    # -----------------------
-    # Ignore non-expense
-    # -----------------------
+    # IGNORE
     if parsed["category"] == "ignore":
         return Response(
-            "<Response><Message>Ignored ❌</Message></Response>",
+            "<Response><Message>Could not read receipt ❌</Message></Response>",
             media_type="application/xml"
         )
 
-    # -----------------------
     # SAVE
-    # -----------------------
     try:
         save_to_db([
             datetime.datetime.now(),
@@ -256,16 +242,24 @@ async def webhook(request: Request):
             parsed["category"],
             parsed["amount"],
             parsed["notes"],
-            message if message else "image_receipt"
+            message if message else "image"
         ])
     except Exception as e:
         print("DB ERROR:", e)
         return Response(
-            "<Response><Message>DB Error ❌</Message></Response>",
+            "<Response><Message>DB error ❌</Message></Response>",
             media_type="application/xml"
         )
 
     return Response(
-        f"<Response><Message>Saved ✅ ₹{parsed['amount']}</Message></Response>",
+        f"<Response><Message>Saved ₹{parsed['amount']} ✅</Message></Response>",
         media_type="application/xml"
     )
+
+
+# -------------------------------
+# HEALTH CHECK
+# -------------------------------
+@app.get("/")
+def root():
+    return {"status": "running"}
