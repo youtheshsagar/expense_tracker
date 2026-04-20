@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request, BackgroundTasks
-from fastapi.responses import Response
+from fastapi.responses import Response, JSONResponse
 from groq import Groq
 import psycopg2
 import psycopg2.extras
@@ -7,6 +7,8 @@ import os
 import re
 import json
 import datetime
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from dotenv import load_dotenv
 import resend
@@ -73,7 +75,6 @@ def extract_expense_simple(text):
 # Text Expense Extraction
 # -------------------------------
 def extract_expense(text):
-    """Extract expense from text using Groq."""
     try:
         client = get_groq()
 
@@ -115,128 +116,66 @@ If no expense: {{"category":"ignore", "amount":0, "merchant":"unknown", "notes":
     return extract_expense_simple(text)
 
 # -------------------------------
-# Image Expense Extraction (GROQ VISION)
+# Image Expense Extraction
 # -------------------------------
 def extract_expense_from_image(image_url):
-    """Extract expense from receipt using Groq Llama 3.2 Vision."""
     try:
-        print(f"\n{'='*60}")
-        print(f"🔍 GROQ VISION ANALYSIS")
-        print(f"{'='*60}")
-        print(f"Image URL: {image_url}")
+        print(f"🔍 Analyzing image: {image_url}")
        
-        # Download and encode image
-        print(f"⬇️  Downloading image...")
         response = requests.get(image_url, timeout=30)
         response.raise_for_status()
        
-        # Convert to base64
         image_base64 = base64.b64encode(response.content).decode('utf-8')
         image_data_url = f"data:image/jpeg;base64,{image_base64}"
        
-        print(f"✅ Image downloaded and encoded ({len(response.content)} bytes)")
-       
-        # Get Groq client
         client = get_groq()
        
-        # Prompt
-        prompt = """You are an expert at reading receipts, bills, and invoices. Analyze this image carefully.
+        prompt = """Extract expense from this receipt/bill image.
 
-**TASK:** Extract expense information from this receipt/bill.
-
-Look for:
-1. **Total Amount** - Find the FINAL TOTAL (look for: "Total", "Grand Total", "Amount", "Net Amount", "Balance Due")
-2. **Merchant Name** - Shop/company name (usually at the top)
-3. **Category** - Based on items purchased
-4. **Items** - Brief description of what was bought
-
-**IMPORTANT RULES:**
-- Extract the FINAL TOTAL amount (not subtotal or individual item prices)
-- Remove currency symbols (₹, Rs, $) and commas - return just the number
-- If multiple totals exist, choose the largest one near "Total"
-- Make your best estimate even if image is slightly unclear
-
-**RESPONSE FORMAT** (MUST be valid JSON only, no other text):
+Return ONLY valid JSON:
 {
-  "category": "materials",
-  "amount": 15000,
-  "merchant": "ABC Hardware",
-  "notes": "cement bags, sand"
+  "category": "materials|labour|transport|food|general",
+  "amount": <number>,
+  "merchant": "<shop name>",
+  "notes": "<brief description>"
 }
 
-**Categories** (choose most appropriate):
-- materials: cement, sand, bricks, steel, paint, hardware, building supplies
-- labour: wages, worker payments, contractor fees
-- transport: diesel, fuel, vehicle, delivery charges
-- food: meals, groceries, restaurant
-- general: anything else
+Find the TOTAL amount (remove ₹, Rs, $, commas).
+Choose appropriate category based on items purchased."""
 
-If image is completely unreadable:
-{
-  "category": "general",
-  "amount": 0,
-  "merchant": "unreadable",
-  "notes": "Image quality too poor"
-}"""
-
-        # Create vision request
-        print(f"🤖 Sending to Groq Llama Vision...")
-       
         completion = client.chat.completions.create(
-            model="meta-llama/llama-4-scout-17b-16e-instruct",  # Groq's vision model
+            model="llama-4-scout",
             messages=[
                 {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "text",
-                            "text": prompt
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": image_data_url
-                            }
-                        }
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": image_data_url}}
                     ]
                 }
             ],
             temperature=0.2,
-            max_tokens=500
+            max_tokens=300
         )
        
         content = completion.choices[0].message.content.strip()
-       
-        print(f"\n📄 GROQ RESPONSE:")
-        print(f"{'-'*60}")
-        print(content)
-        print(f"{'-'*60}\n")
-       
-        # Clean response
         content = re.sub(r'^```json\s*', '', content, flags=re.IGNORECASE)
         content = re.sub(r'^```\s*', '', content)
-        content = re.sub(r'\s*```$', '', content)
-        content = content.strip()
+        content = re.sub(r'\s*```$', '', content).strip()
        
-        # Parse JSON
         match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', content, re.DOTALL)
         if match:
-            json_str = match.group()
-            print(f"📋 Extracted JSON: {json_str}\n")
+            parsed = json.loads(match.group())
            
-            parsed = json.loads(json_str)
-           
-            # Validate
             if all(k in parsed for k in ["category", "amount", "merchant", "notes"]):
                 amount = float(parsed["amount"])
                
                 if amount <= 0:
-                    print(f"⚠️  Zero/negative amount: {amount}")
                     return {
                         "category": "general",
                         "amount": 100,
                         "merchant": "Review needed",
-                        "notes": f"Extracted amount was {amount}. URL: {image_url}"
+                        "notes": f"Extracted amount was {amount}"
                     }
                
                 parsed["amount"] = amount
@@ -245,34 +184,17 @@ If image is completely unreadable:
                 if parsed["category"] not in valid_cats:
                     parsed["category"] = "general"
                
-                print(f"✅ SUCCESS - Extracted:")
-                print(f"   Amount: ₹{amount:,.2f}")
-                print(f"   Category: {parsed['category']}")
-                print(f"   Merchant: {parsed['merchant']}")
-                print(f"{'='*60}\n")
-               
+                print(f"✅ Extracted: ₹{amount:,.2f} - {parsed['category']}")
                 return parsed
-            else:
-                print(f"⚠️  Missing required fields")
-        else:
-            print(f"⚠️  No JSON found in response")
 
-    except requests.RequestException as e:
-        print(f"❌ Download error: {e}")
-    except json.JSONDecodeError as e:
-        print(f"❌ JSON parse error: {e}")
     except Exception as e:
-        print(f"❌ Groq vision error: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"❌ Vision error: {e}")
 
-    # Fallback
-    print(f"⚠️  Using fallback values")
     return {
         "category": "general",
         "amount": 100,
         "merchant": "Manual review needed",
-        "notes": f"Extraction failed. URL: {image_url}"
+        "notes": "Extraction failed"
     }
 
 # -------------------------------
@@ -313,10 +235,7 @@ def save_expense_from_file(parsed_data, file_url):
     cur = conn.cursor()
 
     try:
-        print(f"\n💾 SAVING TO DATABASE")
-        print(f"   Amount: ₹{parsed_data['amount']:,.2f}")
-        print(f"   Category: {parsed_data['category']}")
-        print(f"   Merchant: {parsed_data['merchant']}")
+        print(f"💾 Saving: ₹{parsed_data['amount']:,.2f} - {parsed_data['category']}")
        
         cur.execute("""
             INSERT INTO expense (amount, category, merchant, expense_date, raw_text)
@@ -332,15 +251,12 @@ def save_expense_from_file(parsed_data, file_url):
        
         expense_id = cur.fetchone()[0]
         conn.commit()
-       
-        print(f"✅ Expense saved! ID: {expense_id}\n")
+        print(f"✅ Saved ID: {expense_id}")
         return expense_id
        
     except Exception as e:
         conn.rollback()
         print(f"❌ Database error: {e}")
-        import traceback
-        traceback.print_exc()
         return None
     finally:
         cur.close()
@@ -351,9 +267,7 @@ def save_expense_from_file(parsed_data, file_url):
 # -------------------------------
 def process_media(message_sid, phone, raw_text):
     try:
-        print(f"\n{'#'*60}")
-        print(f"📱 PROCESSING MEDIA - SID: {message_sid}")
-        print(f"{'#'*60}\n")
+        print(f"📱 Processing media - SID: {message_sid}")
        
         twilio_client = get_twilio()
         supabase = get_supabase()
@@ -367,17 +281,14 @@ def process_media(message_sid, phone, raw_text):
             print("❌ No media found")
             return
        
-        print(f"✅ Found {len(media_list)} file(s)\n")
+        print(f"✅ Found {len(media_list)} file(s)")
        
         conn = get_db_connection()
         cur = conn.cursor()
        
         for idx, media in enumerate(media_list, 1):
-            print(f"{'-'*60}")
-            print(f"📄 FILE {idx}/{len(media_list)}")
-            print(f"{'-'*60}")
+            print(f"📄 Processing file {idx}/{len(media_list)}")
            
-            # Get metadata
             uri = media.uri or ""
             json_path = uri if uri.endswith(".json") else f"{uri}.json"
             meta_url = f"https://api.twilio.com{json_path}"
@@ -385,15 +296,11 @@ def process_media(message_sid, phone, raw_text):
             meta_resp.raise_for_status()
             meta = meta_resp.json()
            
-            # Download
             binary_path = json_path.removesuffix(".json")
             media_url = f"https://api.twilio.com{binary_path}"
             response = requests.get(media_url, auth=(account_sid, auth_token))
             response.raise_for_status()
            
-            print(f"✅ Downloaded ({len(response.content)} bytes)")
-           
-            # File info
             content_type = meta.get("content_type") or media.content_type or "application/octet-stream"
             ext = content_type.split("/")[-1]
             if ext == "jpeg":
@@ -402,7 +309,6 @@ def process_media(message_sid, phone, raw_text):
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"{phone.replace('+', '')}_{timestamp}_{media.sid}.{ext}"
            
-            # Upload to Supabase
             storage_path = f"expense-media/{filename}"
             supabase.storage.from_("expense-files").upload(
                 storage_path,
@@ -411,10 +317,8 @@ def process_media(message_sid, phone, raw_text):
             )
            
             file_url = supabase.storage.from_("expense-files").get_public_url(storage_path)
-            print(f"✅ Uploaded: {storage_path}")
-            print(f"✅ URL: {file_url}")
+            print(f"✅ Uploaded: {file_url}")
            
-            # Metadata
             content_metadata = {
                 "content_type": content_type,
                 "file_size": len(response.content),
@@ -424,7 +328,6 @@ def process_media(message_sid, phone, raw_text):
                 "uploaded_at": datetime.datetime.now().isoformat()
             }
            
-            # Save to expense_file_upload
             try:
                 cur.execute("""
                     INSERT INTO expense_file_upload (url, content, merchant, expense_date, raw_text)
@@ -440,28 +343,24 @@ def process_media(message_sid, phone, raw_text):
                
                 file_upload_id = cur.fetchone()[0]
                 conn.commit()
-                print(f"✅ Saved to expense_file_upload, ID: {file_upload_id}")
+                print(f"✅ Saved file upload ID: {file_upload_id}")
                
             except Exception as e:
                 conn.rollback()
                 print(f"❌ Error saving file upload: {e}")
                 continue
            
-            # Process images with Groq Vision
             if content_type.startswith("image/"):
-                print(f"\n🖼️  IMAGE DETECTED - Starting Groq Vision analysis...\n")
+                print(f"🖼️ Analyzing image with Llama 4 Scout...")
                
                 parsed_expense = extract_expense_from_image(file_url)
-               
-                # Save to expense table
                 expense_id = save_expense_from_file(parsed_expense, file_url)
                
                 if expense_id:
-                    # Update file_upload with extraction data
                     try:
                         content_metadata["llm_extraction"] = {
                             "extracted_at": datetime.datetime.now().isoformat(),
-                            "model": "llama-3.2-90b-vision-preview",
+                            "model": "llama-4-scout",
                             "expense_id": expense_id,
                             "extracted_data": parsed_expense
                         }
@@ -476,270 +375,265 @@ def process_media(message_sid, phone, raw_text):
                             file_upload_id
                         ))
                         conn.commit()
-                        print(f"✅ Updated file_upload with extraction data")
                        
                     except Exception as e:
                         conn.rollback()
                         print(f"❌ Error updating file_upload: {e}")
-            else:
-                print(f"⚠️  Non-image file ({content_type})")
        
         cur.close()
         conn.close()
-       
-        print(f"\n{'#'*60}")
-        print(f"✅ MEDIA PROCESSING COMPLETE")
-        print(f"{'#'*60}\n")
+        print(f"✅ Media processing complete")
        
     except Exception as e:
-        print(f"\n❌ MEDIA PROCESSING ERROR: {e}")
+        print(f"❌ Media processing error: {e}")
+
+# -------------------------------
+# SIMPLE EMAIL REPORT ENDPOINT
+# -------------------------------
+@app.get("/send-report")
+def send_email_report():
+    """
+    Simple endpoint to send expense report email.
+    Call this URL: http://your-domain.com/send-report
+    """
+    try:
+        print("📧 Generating report...")
+       
+        # Get today's expenses
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+       
+        cur.execute("""
+            SELECT
+                id, amount, category, merchant, raw_text,
+                TO_CHAR(expense_date, 'YYYY-MM-DD HH24:MI') as date
+            FROM expense
+            WHERE expense_date >= CURRENT_DATE
+            ORDER BY expense_date DESC, id DESC
+        """)
+       
+        expenses = cur.fetchall()
+       
+        if not expenses:
+            cur.close()
+            conn.close()
+            return {
+                "status": "no_data",
+                "message": "No expenses found today"
+            }
+       
+        # Calculate totals by category
+        cur.execute("""
+            SELECT
+                category,
+                COUNT(*) as count,
+                SUM(amount) as total
+            FROM expense
+            WHERE expense_date >= CURRENT_DATE
+            GROUP BY category
+            ORDER BY total DESC
+        """)
+       
+        summary = cur.fetchall()
+        cur.close()
+        conn.close()
+       
+        total_amount = sum(float(row['total']) for row in summary)
+       
+        print(f"✅ Found {len(expenses)} expenses, Total: ₹{total_amount:,.2f}")
+       
+        # Build simple HTML email
+        category_rows = ""
+        for row in summary:
+            percentage = (float(row['total']) / total_amount * 100) if total_amount > 0 else 0
+            category_rows += f"""
+            <tr>
+                <td style="padding: 10px;">{row['category'].title()}</td>
+                <td style="padding: 10px; text-align: right; font-weight: bold;">₹{float(row['total']):,.2f}</td>
+                <td style="padding: 10px; text-align: center;">{int(row['count'])}</td>
+                <td style="padding: 10px; text-align: right;">{percentage:.1f}%</td>
+            </tr>
+            """
+       
+        expense_rows = ""
+        for exp in expenses:
+            expense_rows += f"""
+            <tr>
+                <td style="padding: 8px; font-size: 13px;">{exp['date']}</td>
+                <td style="padding: 8px; font-size: 13px;">{exp['category'].title()}</td>
+                <td style="padding: 8px; font-size: 13px;">{exp['merchant']}</td>
+                <td style="padding: 8px; text-align: right; font-weight: bold;">₹{float(exp['amount']):,.2f}</td>
+            </tr>
+            """
+       
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <body style="font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f5f5f5;">
+            <div style="max-width: 700px; margin: 0 auto; background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+               
+                <!-- Header -->
+                <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 30px; text-align: center;">
+                    <h1 style="margin: 0; color: white; font-size: 28px;">📊 Daily Expense Report</h1>
+                    <p style="margin: 10px 0 0; color: rgba(255,255,255,0.9);">{datetime.date.today().strftime('%B %d, %Y')}</p>
+                </div>
+               
+                <!-- Total -->
+                <div style="background: #f9fafb; padding: 25px; text-align: center;">
+                    <p style="margin: 0; color: #666; font-size: 12px; text-transform: uppercase;">Total Expenses</p>
+                    <p style="margin: 10px 0 0; color: #1f2937; font-size: 40px; font-weight: bold;">₹{total_amount:,.2f}</p>
+                    <p style="margin: 5px 0 0; color: #666;">{len(expenses)} transactions</p>
+                </div>
+               
+                <!-- Category Summary -->
+                <div style="padding: 25px;">
+                    <h2 style="margin: 0 0 15px; font-size: 20px;">📊 By Category</h2>
+                    <table style="width: 100%; border-collapse: collapse;">
+                        <thead>
+                            <tr style="background: #f3f4f6;">
+                                <th style="padding: 10px; text-align: left;">Category</th>
+                                <th style="padding: 10px; text-align: right;">Total</th>
+                                <th style="padding: 10px; text-align: center;">Count</th>
+                                <th style="padding: 10px; text-align: right;">%</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {category_rows}
+                        </tbody>
+                    </table>
+                </div>
+               
+                <!-- Transactions -->
+                <div style="padding: 25px; background: #f9fafb;">
+                    <h2 style="margin: 0 0 15px; font-size: 20px;">📝 All Transactions</h2>
+                    <table style="width: 100%; border-collapse: collapse; background: white;">
+                        <thead>
+                            <tr style="background: #667eea; color: white;">
+                                <th style="padding: 10px; text-align: left;">Date</th>
+                                <th style="padding: 10px; text-align: left;">Category</th>
+                                <th style="padding: 10px; text-align: left;">Merchant</th>
+                                <th style="padding: 10px; text-align: right;">Amount</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {expense_rows}
+                        </tbody>
+                    </table>
+                </div>
+               
+                <!-- Footer -->
+                <div style="padding: 20px; text-align: center; background: #1f2937; color: white;">
+                    <p style="margin: 0; font-size: 12px;">Expense Tracker Pro - Powered by Llama AI</p>
+                </div>
+               
+            </div>
+        </body>
+        </html>
+        """
+       
+        # Send email using Resend
+        resend.api_key = os.getenv("RESEND_API_KEY")
+       
+        email_params = {
+            "from": os.getenv("EMAIL_FROM", "Expense Tracker <onboarding@resend.dev>"),
+            "to": [os.getenv("EMAIL_TO")],
+            "subject": f"📊 Expense Report - {datetime.date.today().strftime('%B %d, %Y')}",
+            "html": html
+        }
+       
+        response = resend.Emails.send(email_params)
+       
+        print(f"✅ Email sent! ID: {response.get('id')}")
+       
+        return {
+            "status": "success",
+            "message": "Report sent successfully",
+            "email_id": response.get('id'),
+            "date": datetime.date.today().isoformat(),
+            "total": f"₹{total_amount:,.2f}",
+            "transactions": len(expenses),
+            "breakdown": {row['category']: float(row['total']) for row in summary}
+        }
+       
+    except Exception as e:
+        print(f"❌ Error: {e}")
         import traceback
         traceback.print_exc()
-
-# -------------------------------
-# Analytics Functions
-# -------------------------------
-def get_today_summary():
-    conn = get_db_connection()
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT category, SUM(amount)
-        FROM expense
-        WHERE expense_date = CURRENT_DATE
-        GROUP BY category
-        ORDER BY SUM(amount) DESC
-    """)
-
-    data = cur.fetchall()
-    cur.close()
-    conn.close()
-    return data
-
-def generate_chart(data):
-    if not data:
-        return None
-   
-    categories = [x[0] for x in data]
-    amounts = [float(x[1]) for x in data]
-
-    plt.figure(figsize=(10, 6))
-    plt.bar(categories, amounts, color='steelblue')
-    plt.title("Daily Expenses by Category", fontsize=14, fontweight='bold')
-    plt.xlabel("Category", fontsize=12)
-    plt.ylabel("Amount (₹)", fontsize=12)
-    plt.xticks(rotation=45, ha='right')
-   
-    for i, v in enumerate(amounts):
-        plt.text(i, v, f'₹{v:,.0f}', ha='center', va='bottom')
-   
-    plt.tight_layout()
-
-    path = "/tmp/chart.png"
-    plt.savefig(path, dpi=300)
-    plt.close()
-
-    return path
-
-def analyze_with_llm(data):
-    client = get_groq()
-
-    data_dict = {cat: float(amt) for cat, amt in data}
-    total = sum(data_dict.values())
-
-    prompt = f"""Financial analyst for construction expenses.
-
-Today's data:
-{json.dumps(data_dict, indent=2)}
-
-Total: ₹{total:,.2f}
-
-Provide brief analysis (max 150 words):
-1. Total spend
-2. Highest category & %
-3. Anomalies
-4. Cost optimization tip
-"""
-
-    res = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3
-    )
-
-    return res.choices[0].message.content
-
-def send_email(report, chart_path):
-    resend.api_key = os.getenv("RESEND_API_KEY")
-
-    attachments = []
-    if chart_path and os.path.exists(chart_path):
-        with open(chart_path, "rb") as f:
-            chart = f.read()
-        attachments.append({
-            "filename": "expense_chart.png",
-            "content": chart
-        })
-
-    resend.Emails.send({
-        "from": "Expense Tracker <onboarding@resend.dev>",
-        "to": [os.getenv("EMAIL_TO")],
-        "subject": f"Daily Expense Report - {datetime.date.today().strftime('%d %b %Y')}",
-        "html": f"<h2>Daily Expense Analysis</h2><pre>{report}</pre>",
-        "attachments": attachments
-    })
-
-# -------------------------------
-# API Endpoints
-# -------------------------------
-@app.post("/webhook")
-async def webhook(request: Request, background_tasks: BackgroundTasks):
-    data = await request.form()
-
-    msg = data.get("Body", "").strip()
-    sender = data.get("From", "")
-    message_sid = data.get("MessageSid", "")
-    num_media = int(data.get("NumMedia", 0))
-
-    print(f"\n📨 From {sender}: {msg} ({num_media} files)")
-
-    # Text only
-    if num_media == 0 and msg:
-        parsed = extract_expense(msg)
-
-        if parsed["category"] == "ignore":
-            return Response(
-                "<Response><Message>❌ No expense info. Please specify amount and category.</Message></Response>",
-                media_type="application/xml"
-            )
-
-        expense_id = save_text_expense(sender, parsed, msg)
        
-        if expense_id:
-            response_msg = f"✅ Saved ₹{parsed['amount']:,} ({parsed['category']})"
-        else:
-            response_msg = "❌ Error saving. Try again."
+        return {
+            "status": "error",
+            "message": str(e)
+        }
 
-        return Response(
-            f"<Response><Message>{response_msg}</Message></Response>",
-            media_type="application/xml"
-        )
-
-    # Media
-    elif num_media > 0:
-        background_tasks.add_task(process_media, message_sid, sender, msg)
+# -------------------------------
+# WhatsApp Webhook
+# -------------------------------
+@app.post("/whatsapp")
+async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
+    try:
+        form_data = await request.form()
+        data = dict(form_data)
        
-        response_msg = f"✅ Received {num_media} file(s). Analyzing with Groq Vision AI..."
+        from_number = data.get("From", "")
+        body = data.get("Body", "").strip()
+        message_sid = data.get("MessageSid", "")
+        num_media = int(data.get("NumMedia", 0))
+       
+        print(f"\n📩 WhatsApp from {from_number}: {body}")
+       
+        if num_media > 0:
+            print(f"📎 {num_media} file(s) attached")
+            background_tasks.add_task(process_media, message_sid, from_number, body)
+            return Response(content="", media_type="text/plain")
+       
+        if not body or len(body) < 2:
+            return Response(content="", media_type="text/plain")
+       
+        parsed = extract_expense(body)
+       
+        if parsed["category"] != "ignore" and parsed["amount"] > 0:
+            expense_id = save_text_expense(from_number, parsed, body)
+           
+            if expense_id:
+                print(f"✅ Saved: ₹{parsed['amount']} ({parsed['category']})")
+       
+        return Response(content="", media_type="text/plain")
+       
+    except Exception as e:
+        print(f"❌ Webhook error: {e}")
+        import traceback
+        traceback.print_exc()
+        return Response(content="", media_type="text/plain", status_code=500)
 
-        return Response(
-            f"<Response><Message>{response_msg}</Message></Response>",
-            media_type="application/xml"
-        )
-
-    # Empty
-    else:
-        return Response(
-            "<Response><Message>Send expense details or attach receipt image.</Message></Response>",
-            media_type="application/xml"
-        )
-
-@app.get("/send-daily-report")
-def send_daily():
-    data = get_today_summary()
-
-    if not data:
-        return {"status": "no data"}
-
-    chart = generate_chart(data)
-    report = analyze_with_llm(data)
-
-    send_email(report, chart)
-
-    total = sum(float(x[1]) for x in data)
-
-    return {
-        "status": "sent",
-        "date": datetime.date.today().isoformat(),
-        "total": f"₹{total:,.2f}",
-        "breakdown": {cat: float(amt) for cat, amt in data}
-    }
-
+# -------------------------------
+# Basic Endpoints
+# -------------------------------
 @app.get("/")
-def health():
-    return {
-        "status": "active",
-        "service": "expense-tracker",
-        "version": "4.0-groq-vision",
-        "models": {
-            "text": "llama-3.1-8b-instant",
-            "vision": "llama-3.2-90b-vision-preview",
-            "analysis": "llama-3.3-70b-versatile"
-        },
-        "provider": "Groq (100% free)"
-    }
+def root():
+    return {"status": "running", "message": "Expense Tracker API"}
 
 @app.get("/expenses/today")
-def get_today():
-    conn = get_db_connection()
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT id, amount, category, merchant, raw_text,
-               TO_CHAR(expense_date, 'YYYY-MM-DD') as date
-        FROM expense
-        WHERE expense_date = CURRENT_DATE
-        ORDER BY id DESC
-    """)
-
-    columns = [desc[0] for desc in cur.description]
-    results = [dict(zip(columns, row)) for row in cur.fetchall()]
-
-    cur.close()
-    conn.close()
-
-    total = sum(float(r['amount']) for r in results)
-
-    return {
-        "date": datetime.date.today().isoformat(),
-        "count": len(results),
-        "total": f"₹{total:,.2f}",
-        "expenses": results
-    }
-
-@app.get("/file-uploads/today")
-def get_uploads():
+def get_today_expenses():
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
+   
     cur.execute("""
-        SELECT id, url, content, merchant,
-               TO_CHAR(expense_date, 'YYYY-MM-DD') as date, raw_text
-        FROM expense_file_upload
-        WHERE expense_date = CURRENT_DATE
-        ORDER BY id DESC
+        SELECT id, amount, category, merchant,
+               TO_CHAR(expense_date, 'YYYY-MM-DD HH24:MI') as date
+        FROM expense
+        WHERE expense_date >= CURRENT_DATE
+        ORDER BY expense_date DESC
     """)
-
-    results = cur.fetchall()
+   
+    expenses = cur.fetchall()
+    total = sum(float(e['amount']) for e in expenses)
+   
     cur.close()
     conn.close()
-
+   
     return {
         "date": datetime.date.today().isoformat(),
-        "count": len(results),
-        "uploads": results
-    }
-
-@app.post("/test-extract-image")
-async def test_image(request: Request):
-    data = await request.json()
-    image_url = data.get("image_url", "")
-   
-    if not image_url:
-        return {"error": "No image_url provided"}
-   
-    result = extract_expense_from_image(image_url)
-    return {
-        "status": "success",
-        "extracted": result,
-        "needs_review": result.get("merchant") == "Manual review needed"
+        "total": total,
+        "count": len(expenses),
+        "expenses": expenses
     }
