@@ -40,7 +40,7 @@ def get_conn():
     return psycopg2.connect(DB_CONN_STRING)
 
 # =========================
-# SAFE JSON
+# SAFE JSON PARSER
 # =========================
 def safe_json_parse(text):
     try:
@@ -53,44 +53,15 @@ def safe_json_parse(text):
         raise
 
 # =========================
-# CREATE TABLES (FIXED)
+# DOWNLOAD TWILIO MEDIA (FIX)
 # =========================
-def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-
-    # EXPENSES TABLE (FULL RESET SAFE VERSION)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS expenses (
-            id SERIAL PRIMARY KEY,
-            amount FLOAT,
-            category TEXT,
-            merchant TEXT,
-            expense_date TEXT,
-            raw_text TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # FILE TABLE
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS expenses_file_upload (
-            id SERIAL PRIMARY KEY,
-            url TEXT,
-            content JSONB,
-            uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-# run once at startup
-init_db()
+def download_media(url):
+    headers = {"User-Agent": "Mozilla/5.0"}
+    r = requests.get(url, headers=headers, allow_redirects=True)
+    return r.content
 
 # =========================
-# OCR
+# OCR SAFE
 # =========================
 def extract_text(file_bytes, content_type):
     try:
@@ -98,18 +69,23 @@ def extract_text(file_bytes, content_type):
             with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
                 return "\n".join([p.extract_text() or "" for p in pdf.pages])
 
-        img = Image.open(io.BytesIO(file_bytes))
-        return pytesseract.image_to_string(img)
+        image_stream = io.BytesIO(file_bytes)
+        image = Image.open(image_stream)
+        image.verify()
+
+        image = Image.open(io.BytesIO(file_bytes))
+        return pytesseract.image_to_string(image)
+
     except Exception as e:
         print("OCR ERROR:", e)
-        return "OCR_FAILED"
+        return None
 
 # =========================
-# LLM
+# LLM EXPENSE EXTRACTION
 # =========================
 def extract_expense_with_llm(text):
     prompt = f"""
-Extract expense info.
+Extract expense data.
 
 Return ONLY JSON:
 {{
@@ -146,25 +122,23 @@ def upload_file(file_bytes, filename):
     return supabase.storage.from_(BUCKET).get_public_url(name)
 
 # =========================
-# INSERT HELPERS
+# DB INSERT
 # =========================
-def insert_file_record(url, data):
+def insert_expense(data, raw_text):
     conn = get_conn()
     cur = conn.cursor()
 
     cur.execute("""
-        INSERT INTO expenses_file_upload (url, content)
-        VALUES (%s, %s)
-    """, (url, json.dumps(data)))
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
-def insert_expense(data, raw_text):
-    conn = get_conn()
-    cur = conn.cursor()
+    CREATE TABLE IF NOT EXISTS expenses (
+        id SERIAL PRIMARY KEY,
+        amount FLOAT,
+        category TEXT,
+        merchant TEXT,
+        expense_date TEXT,
+        raw_text TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
 
     cur.execute("""
         INSERT INTO expenses (amount, category, merchant, expense_date, raw_text)
@@ -182,14 +156,39 @@ def insert_expense(data, raw_text):
     conn.close()
 
 # =========================
-# ROOT (FIX FOR 404)
+# FILE LOG TABLE
+# =========================
+def insert_file_record(url, data):
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS expenses_file_upload (
+        id SERIAL PRIMARY KEY,
+        url TEXT,
+        content JSONB,
+        uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+        INSERT INTO expenses_file_upload (url, content)
+        VALUES (%s, %s)
+    """, (url, json.dumps(data)))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+# =========================
+# ROOT
 # =========================
 @app.get("/")
 def home():
     return {"status": "running"}
 
 # =========================
-# TWILIO WEBHOOK (FIXED)
+# TWILIO WEBHOOK (FIXED PIPELINE)
 # =========================
 @app.post("/twilio/webhook")
 async def webhook(request: Request):
@@ -197,27 +196,37 @@ async def webhook(request: Request):
 
     try:
         form = await request.form()
-        msg = form.get("Body")
-        num_media = int(form.get("NumMedia", 0))
+        msg = form.get("Body", "")
+        num_media = int(form.get("NumMedia", 0) or 0)
 
-        # TEXT
+        # ======================
+        # TEXT MESSAGE
+        # ======================
         if num_media == 0:
-            insert_expense(
-                {"amount": None, "category": None, "merchant": None, "date": None},
-                msg
+            structured = extract_expense_with_llm(msg)
+
+            insert_expense(structured, msg)
+
+            response.message(
+                f"✅ Saved ₹{structured.get('amount')} ({structured.get('category')})"
             )
-            response.message("✅ Text expense saved")
             return str(response)
 
-        # FILE
+        # ======================
+        # FILE MESSAGE
+        # ======================
         media_url = form.get("MediaUrl0")
-        content_type = form.get("MediaContentType0")
+        content_type = form.get("MediaContentType0", "")
 
-        file_bytes = requests.get(media_url).content
+        file_bytes = download_media(media_url)
 
-        file_url = upload_file(file_bytes, "file")
+        file_url = upload_file(file_bytes, "expense_file")
 
         raw_text = extract_text(file_bytes, content_type)
+
+        if not raw_text:
+            response.message("❌ Could not read image/PDF")
+            return str(response)
 
         structured = extract_expense_with_llm(raw_text)
 
@@ -232,7 +241,7 @@ async def webhook(request: Request):
         response.message("📊 Expense processed successfully")
 
     except Exception as e:
-        print("FULL ERROR:", e)
+        print("FULL ERROR:", str(e))
         response.message("❌ Failed to process file")
 
     return str(response)
