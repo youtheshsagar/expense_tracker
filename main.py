@@ -10,26 +10,18 @@ import re
 import os
 from dotenv import load_dotenv
 
-# OCR
 import pytesseract
 from PIL import Image
 import pdfplumber
 
-# LLM (GROQ)
 from groq import Groq
 
-# =========================
-# LOAD ENV
-# =========================
 load_dotenv()
 
-# =========================
-# FASTAPI APP
-# =========================
 app = FastAPI()
 
 # =========================
-# ENV VARIABLES
+# ENV
 # =========================
 SUPABASE_URL = "https://zasmsfjahuuwafjiajqp.supabase.co"
 SUPABASE_KEY = os.getenv("SUPABASE_API_KEY")
@@ -38,24 +30,21 @@ BUCKET = "expense-files"
 GROQ_KEY = os.getenv("GROQ_API_KEY")
 DB_CONN_STRING = os.getenv("DATABASE_URL")
 
-# =========================
-# CLIENTS
-# =========================
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 client = Groq(api_key=GROQ_KEY)
 
 # =========================
-# DB CONNECTION
+# DB
 # =========================
 def get_conn():
     return psycopg2.connect(DB_CONN_STRING)
 
 # =========================
-# SAFE JSON PARSER
+# SAFE JSON
 # =========================
 def safe_json_parse(text):
     try:
-        text = text.strip().replace("```json", "").replace("```", "")
+        text = text.replace("```json", "").replace("```", "").strip()
         return json.loads(text)
     except:
         match = re.search(r"\{.*\}", text, re.DOTALL)
@@ -64,11 +53,63 @@ def safe_json_parse(text):
         raise
 
 # =========================
-# LLM EXTRACTION
+# CREATE TABLES (FIXED)
+# =========================
+def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # EXPENSES TABLE (FULL RESET SAFE VERSION)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS expenses (
+            id SERIAL PRIMARY KEY,
+            amount FLOAT,
+            category TEXT,
+            merchant TEXT,
+            expense_date TEXT,
+            raw_text TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # FILE TABLE
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS expenses_file_upload (
+            id SERIAL PRIMARY KEY,
+            url TEXT,
+            content JSONB,
+            uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+# run once at startup
+init_db()
+
+# =========================
+# OCR
+# =========================
+def extract_text(file_bytes, content_type):
+    try:
+        if "pdf" in content_type:
+            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+                return "\n".join([p.extract_text() or "" for p in pdf.pages])
+
+        img = Image.open(io.BytesIO(file_bytes))
+        return pytesseract.image_to_string(img)
+    except Exception as e:
+        print("OCR ERROR:", e)
+        return "OCR_FAILED"
+
+# =========================
+# LLM
 # =========================
 def extract_expense_with_llm(text):
     prompt = f"""
-Extract expense data.
+Extract expense info.
 
 Return ONLY JSON:
 {{
@@ -82,85 +123,34 @@ TEXT:
 {text}
 """
 
-    response = client.chat.completions.create(
+    res = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.1
     )
 
-    return safe_json_parse(response.choices[0].message.content)
-
-# =========================
-# OCR FUNCTION
-# =========================
-def extract_text(file_bytes, content_type):
-    try:
-        if "pdf" in content_type:
-            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-                return "\n".join([p.extract_text() or "" for p in pdf.pages])
-
-        image = Image.open(io.BytesIO(file_bytes))
-        return pytesseract.image_to_string(image)
-
-    except Exception as e:
-        print("OCR ERROR:", e)
-        return "OCR_FAILED"
+    return safe_json_parse(res.choices[0].message.content)
 
 # =========================
 # SUPABASE UPLOAD
 # =========================
 def upload_file(file_bytes, filename):
-    unique_name = f"{uuid.uuid4()}_{filename}"
+    name = f"{uuid.uuid4()}_{filename}"
 
     supabase.storage.from_(BUCKET).upload(
-        unique_name,
+        name,
         file_bytes,
         file_options={"content-type": "application/octet-stream"}
     )
 
-    return supabase.storage.from_(BUCKET).get_public_url(unique_name)
+    return supabase.storage.from_(BUCKET).get_public_url(name)
 
 # =========================
-# DB FUNCTIONS
+# INSERT HELPERS
 # =========================
-def insert_text_expense(text):
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS expenses (
-            id SERIAL PRIMARY KEY,
-            amount FLOAT,
-            category TEXT,
-            merchant TEXT,
-            expense_date TEXT,
-            raw_text TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    cur.execute("""
-        INSERT INTO expenses (raw_text)
-        VALUES (%s)
-    """, (text,))
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
 def insert_file_record(url, data):
     conn = get_conn()
     cur = conn.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS expenses_file_upload (
-            id SERIAL PRIMARY KEY,
-            url TEXT,
-            content JSONB,
-            uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
 
     cur.execute("""
         INSERT INTO expenses_file_upload (url, content)
@@ -172,7 +162,7 @@ def insert_file_record(url, data):
     conn.close()
 
 
-def insert_structured_expense(data, raw_text):
+def insert_expense(data, raw_text):
     conn = get_conn()
     cur = conn.cursor()
 
@@ -192,56 +182,57 @@ def insert_structured_expense(data, raw_text):
     conn.close()
 
 # =========================
-# TWILIO WEBHOOK
+# ROOT (FIX FOR 404)
+# =========================
+@app.get("/")
+def home():
+    return {"status": "running"}
+
+# =========================
+# TWILIO WEBHOOK (FIXED)
 # =========================
 @app.post("/twilio/webhook")
-async def twilio_webhook(request: Request):
-    form = await request.form()
+async def webhook(request: Request):
     response = MessagingResponse()
 
     try:
+        form = await request.form()
         msg = form.get("Body")
         num_media = int(form.get("NumMedia", 0))
 
-        # =========================
-        # TEXT MESSAGE
-        # =========================
+        # TEXT
         if num_media == 0:
-            insert_text_expense(msg)
-            response.message("✅ Expense saved from text")
+            insert_expense(
+                {"amount": None, "category": None, "merchant": None, "date": None},
+                msg
+            )
+            response.message("✅ Text expense saved")
             return str(response)
 
-        # =========================
-        # FILE MESSAGE
-        # =========================
+        # FILE
         media_url = form.get("MediaUrl0")
         content_type = form.get("MediaContentType0")
 
         file_bytes = requests.get(media_url).content
 
-        # Upload
-        file_url = upload_file(file_bytes, "expense_file")
+        file_url = upload_file(file_bytes, "file")
 
-        # OCR
         raw_text = extract_text(file_bytes, content_type)
 
-        # LLM
         structured = extract_expense_with_llm(raw_text)
 
-        # Save file record
         insert_file_record(file_url, {
             "raw_text": raw_text,
-            "llm_output": structured,
-            "media_type": content_type
+            "llm": structured,
+            "type": content_type
         })
 
-        # Save expense
-        insert_structured_expense(structured, raw_text)
+        insert_expense(structured, raw_text)
 
         response.message("📊 Expense processed successfully")
 
     except Exception as e:
-        print("ERROR:", e)
+        print("FULL ERROR:", e)
         response.message("❌ Failed to process file")
 
     return str(response)
