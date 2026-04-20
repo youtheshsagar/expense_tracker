@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Request
+from fastapi.responses import Response
 from twilio.twiml.messaging_response import MessagingResponse
 from supabase import create_client
 import psycopg2
@@ -53,12 +54,12 @@ def safe_json_parse(text):
         raise
 
 # =========================
-# ROBUST TWILIO DOWNLOAD
+# TWILIO MEDIA DOWNLOAD (FIXED)
 # =========================
 def download_media(url):
     headers = {
         "User-Agent": "Mozilla/5.0",
-        "Accept": "*/*"
+        "Accept": "image/jpeg,image/png,image/*,*/*"
     }
 
     try:
@@ -75,7 +76,6 @@ def is_valid_file(file_bytes):
     if not file_bytes:
         return False
 
-    # HTML response detection (VERY COMMON Twilio issue)
     if file_bytes[:4] == b"<htm" or b"<html" in file_bytes[:100]:
         return False
 
@@ -90,11 +90,10 @@ def is_valid_file(file_bytes):
 def extract_text(file_bytes, content_type):
     try:
         if not is_valid_file(file_bytes):
-            print("INVALID FILE DETECTED")
             return None
 
         # ======================
-        # PDF HANDLING
+        # PDF
         # ======================
         if "pdf" in content_type:
             try:
@@ -106,19 +105,19 @@ def extract_text(file_bytes, content_type):
                 return None
 
         # ======================
-        # IMAGE HANDLING
+        # IMAGE
         # ======================
         try:
-            image = Image.open(io.BytesIO(file_bytes))
-            image.verify()
+            img = Image.open(io.BytesIO(file_bytes))
+            img.verify()
 
-            image = Image.open(io.BytesIO(file_bytes))
-            text = pytesseract.image_to_string(image)
+            img = Image.open(io.BytesIO(file_bytes))
+            text = pytesseract.image_to_string(img)
 
             return text if text.strip() else None
 
         except Exception as e:
-            print("IMAGE OCR ERROR:", e)
+            print("OCR ERROR:", e)
             return None
 
     except Exception as e:
@@ -233,7 +232,7 @@ def home():
     return {"status": "running"}
 
 # =========================
-# TWILIO WEBHOOK (FINAL FIXED)
+# TWILIO WEBHOOK (FULL FIX)
 # =========================
 @app.post("/twilio/webhook")
 async def webhook(request: Request):
@@ -245,7 +244,7 @@ async def webhook(request: Request):
         num_media = int(form.get("NumMedia", 0) or 0)
 
         # ======================
-        # TEXT FLOW
+        # TEXT MESSAGE
         # ======================
         if num_media == 0:
             structured = extract_expense_with_llm(msg)
@@ -255,10 +254,14 @@ async def webhook(request: Request):
             response.message(
                 f"✅ Saved ₹{structured.get('amount')} ({structured.get('category')})"
             )
-            return str(response)
+
+            return Response(
+                content=str(response),
+                media_type="application/xml"
+            )
 
         # ======================
-        # FILE FLOW
+        # FILE MESSAGE
         # ======================
         media_url = form.get("MediaUrl0")
 
@@ -266,7 +269,7 @@ async def webhook(request: Request):
 
         if not file_bytes:
             response.message("❌ Failed to download file")
-            return str(response)
+            return Response(content=str(response), media_type="application/xml")
 
         file_url = upload_file(file_bytes, "expense_file")
 
@@ -274,7 +277,7 @@ async def webhook(request: Request):
 
         if not raw_text:
             response.message("⚠️ Could not read image/PDF")
-            return str(response)
+            return Response(content=str(response), media_type="application/xml")
 
         structured = extract_expense_with_llm(raw_text)
 
@@ -292,4 +295,4 @@ async def webhook(request: Request):
         print("FULL ERROR:", str(e))
         response.message("❌ Failed to process request")
 
-    return str(response)
+    return Response(content=str(response), media_type="application/xml")
