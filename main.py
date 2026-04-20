@@ -9,16 +9,21 @@ import psycopg2
 import requests
 import base64
 from dotenv import load_dotenv
-from PIL import Image
-from io import BytesIO
-import pytesseract
 from requests.auth import HTTPBasicAuth
+
+# OPTIONAL OCR (safe fallback)
+try:
+    from PIL import Image
+    from io import BytesIO
+    import pytesseract
+    OCR_AVAILABLE = True
+except:
+    OCR_AVAILABLE = False
 
 # -------------------------------
 # ENV
 # -------------------------------
 load_dotenv()
-
 app = FastAPI()
 
 _groq_client = None
@@ -35,7 +40,7 @@ def get_groq():
 
 
 # -------------------------------
-# TWILIO IMAGE DOWNLOAD (FIXED)
+# DOWNLOAD IMAGE (TWILIO SAFE)
 # -------------------------------
 def download_image(url):
     sid = os.getenv("TWILIO_ACCOUNT_SID")
@@ -56,13 +61,16 @@ def download_image(url):
 
 
 # -------------------------------
-# OCR
+# OPTIONAL OCR (SAFE)
 # -------------------------------
 def extract_text_ocr(image_bytes):
+    if not OCR_AVAILABLE:
+        return ""
+
     try:
         img = Image.open(BytesIO(image_bytes))
         text = pytesseract.image_to_string(img)
-        print("🧾 OCR TEXT:\n", text)
+        print("🧾 OCR TEXT:", text)
         return text.strip()
     except Exception as e:
         print("OCR ERROR:", e)
@@ -77,7 +85,24 @@ def image_to_base64(image_bytes):
 
 
 # -------------------------------
-# TEXT FALLBACK
+# SAFE JSON PARSER (FIXES ARRAY ISSUE)
+# -------------------------------
+def safe_parse(raw):
+    try:
+        return json.loads(raw)
+    except:
+        try:
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if match:
+                return json.loads(match.group())
+        except:
+            pass
+
+    return {"category": "ignore", "amount": 0, "notes": "parse_failed"}
+
+
+# -------------------------------
+# SIMPLE TEXT FALLBACK
 # -------------------------------
 def extract_expense_simple(text):
     if not text:
@@ -113,7 +138,7 @@ def extract_expense_simple(text):
 
 
 # -------------------------------
-# HYBRID OCR + VISION (MAIN ENGINE)
+# HYBRID VISION ENGINE (FIXED PROMPT)
 # -------------------------------
 def hybrid_extract(image_url):
     try:
@@ -121,10 +146,9 @@ def hybrid_extract(image_url):
 
         img_bytes = download_image(image_url)
 
-        # OCR
-        ocr_text = extract_text_ocr(img_bytes)
+        # OCR (optional)
+        ocr_text = extract_text_ocr(image_bytes)
 
-        # Vision
         img_b64 = image_to_base64(img_bytes)
 
         res = client.chat.completions.create(
@@ -136,21 +160,21 @@ def hybrid_extract(image_url):
                         {
                             "type": "text",
                             "text": f"""
-You are a receipt extractor.
+You are a receipt extraction AI.
 
 OCR TEXT:
 {ocr_text}
 
 RULES:
-- Extract expense even if partially visible
-- Fix OCR mistakes
-- Always return valid JSON
+- Return ONLY ONE JSON OBJECT
+- DO NOT return arrays
+- Combine all items into single total
 
 FORMAT:
 {{
   "category": "materials|labour|transport|general",
   "amount": number,
-  "notes": "short summary"
+  "notes": "summary"
 }}
 
 If nothing found:
@@ -170,16 +194,13 @@ If nothing found:
         )
 
         raw = res.choices[0].message.content
-        print("🧠 VISION RAW:\n", raw)
+        print("🧠 VISION RAW:", raw)
 
-        match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if match:
-            return json.loads(match.group())
+        return safe_parse(raw)
 
     except Exception as e:
         print("HYBRID ERROR:", e)
-
-    return {"category": "ignore", "amount": 0, "notes": "failed"}
+        return {"category": "ignore", "amount": 0, "notes": "failed"}
 
 
 # -------------------------------
@@ -221,7 +242,7 @@ async def webhook(request: Request):
         else:
             parsed = extract_expense_simple(message)
 
-        print("✅ PARSED RESULT:", parsed)
+        print("✅ PARSED:", parsed)
 
         if parsed["category"] == "ignore":
             return Response(
@@ -246,7 +267,7 @@ async def webhook(request: Request):
     except Exception as e:
         print("🔥 WEBHOOK ERROR:", e)
         return Response(
-            "<Response><Message>Server error ❌</Message></Response>",
+            "<Response><Message>Error ❌</Message></Response>",
             media_type="application/xml"
         )
 
